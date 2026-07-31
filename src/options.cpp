@@ -204,6 +204,16 @@ std::vector<OptionDescr> yarpgen::OptionParser::options_set{
      OptionParser::parseAllowUBInDC,
      "none",
      {"none", "some", "all"}},
+    {OptionKind::MAX_ARRAY_DIMS,
+     "",
+     "--max-array-dims",
+     true,
+     "Upper bound on array dimensions (0 = generator default). Lower it to fit "
+     "compilers without a large-memory model, e.g. MSVC",
+     "Can't parse max array dims",
+     OptionParser::parseMaxArrayDims,
+     "0",
+     {}},
 };
 
 static void dumpVersion(std::ostream &stream) {
@@ -511,6 +521,15 @@ void OptionParser::parseAllowUBInDC(std::string allow_ub_in_dc_str) {
         options.setAllowUBInDC(OptionLevel::ALL);
     else
         printHelpAndExit("Can't recognize input as arguments use level");
+}
+
+void OptionParser::parseMaxArrayDims(std::string max_array_dims_str) {
+    Options &options = Options::getInstance();
+    try {
+        options.setMaxArrayDims(std::stoul(max_array_dims_str));
+    } catch (std::exception &) {
+        printHelpAndExit("Can't parse max array dims");
+    }
 }
 
 void Options::dump(std::ostream &stream) {

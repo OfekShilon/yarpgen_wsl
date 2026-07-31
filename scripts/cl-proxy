@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+###############################################################################
+#
+# Copyright (c) 2024, Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+###############################################################################
+# cl-proxy presents a GCC/Clang-style command-line interface backed by MSVC's
+# cl.exe, so YARPGen's testing harness can drive MSVC from WSL without any
+# changes to the (GCC-flag-centric) Makefile generator. It is the MSVC
+# counterpart of ispc-proxy / ispc-disp.
+#
+# It does three things:
+#   1. Translates the GCC-style flags the harness emits into cl.exe syntax.
+#   2. Invokes cl.exe through cmd.exe with the MSVC environment loaded
+#      (vcvars64.bat).
+#   3. Wraps the produced Windows .exe in a tiny shell launcher that also
+#      strips CRLF from its output, so the rest of the harness can treat it as
+#      an ordinary native binary and its checksum matches other compilers'.
+#
+# REQUIREMENTS / GOTCHAS
+#   * Run the whole flow from a Windows-visible directory (under /mnt/<drive>/).
+#     cl.exe cannot see WSL paths such as /home/..., and cmd.exe refuses a UNC
+#     working directory (\\wsl$\...). Point YARPGen's --out-dir / run_gen at a
+#     /mnt/c path.
+#   * Put this scripts/ directory on your PATH (same as ispc-proxy).
+#   * Set YARPGEN_VCVARS to your vcvars64.bat if auto-detection fails.
+#   * C++ only. C / ISPC / SYCL are not handled.
+###############################################################################
+import json
+import os
+import re
+import subprocess
+import sys
+
+# Candidate locations for vcvars64.bat (Build Tools and full VS, 2026/2022/2019,
+# both Program Files roots). YARPGEN_VCVARS overrides all of them.
+# Built from version-dirs x editions x install roots. Newest-first so
+# find_vcvars() defaults to the newest installed toolchain. Note the install
+# directory is a version number, not the marketing year: VS 2026 is "18", VS
+# 2022 is "2022"/"17". We list both the version and the year spelling to be safe.
+_VS_YEARS = ["18", "2026", "17", "2022", "2019"]
+_VS_EDITIONS = ["BuildTools", "Community", "Professional", "Enterprise"]
+_VS_ROOTS = ["C:\\Program Files", "C:\\Program Files (x86)"]
+_VCVARS_CANDIDATES = [
+    "%s\\Microsoft Visual Studio\\%s\\%s\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    % (root, year, edition)
+    for year in _VS_YEARS
+    for edition in _VS_EDITIONS
+    for root in _VS_ROOTS
+]
+
+
+def win_path_to_wsl(win_path):
+    p = win_path.strip().strip('"')
+    m = re.match(r"^([A-Za-z]):\\(.*)$", p)
+    if not m:
+        return None
+    drive, rest = m.group(1).lower(), m.group(2).replace("\\", "/")
+    return "/mnt/%s/%s" % (drive, rest)
+
+
+def find_vcvars():
+    env = os.environ.get("YARPGEN_VCVARS")
+    if env:
+        return env
+    for cand in _VCVARS_CANDIDATES:
+        wsl = win_path_to_wsl(cand)
+        if wsl and os.path.isfile(wsl):
+            return cand
+    # Fall back to the first candidate so we produce a clear error from cmd.exe.
+    return _VCVARS_CANDIDATES[0]
+
+
+VCVARS = find_vcvars()
+
+# Exact flags with no MSVC equivalent that we intentionally drop.
+DROP_EXACT = {
+    "-fPIC", "-fpermissive", "-fno-strict-aliasing", "-w",
+    "-fno-sanitize-recover=undefined", "--pic",
+}
+# Flag prefixes to drop (arch selection, sanitizers, linker libs, warnings...).
+DROP_PREFIX = (
+    "-march=", "-mcmodel", "--mcmodel", "-x", "-W", "-fsanitize", "-mllvm",
+    "--target", "-woff", "-rtlib", "-l",
+)
+
+
+def map_std(std):
+    # MSVC /std: accepts c++14, c++17, c++20, c++latest (min is c++14).
+    table = {
+        "c++98": "c++14", "c++03": "c++14", "c++11": "c++14", "c++0x": "c++14",
+        "c++14": "c++14", "c++1y": "c++14", "c++17": "c++17", "c++1z": "c++17",
+        "c++20": "c++20", "c++2a": "c++20", "c++23": "c++latest",
+        "c++2b": "c++latest",
+    }
+    return table.get(std, "c++17")
+
+
+def translate(argv):
+    """GCC-style argv -> (cl args, is_compile_only, output_target)."""
+    out = ["/nologo", "/EHsc", "/w", "/permissive-"]
+    compiling = "-c" in argv
+    target = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "-c":
+            out.append("/c")
+        elif a == "-o":
+            i += 1
+            target = argv[i]
+        elif a == "-O0":
+            out.append("/Od")
+        elif re.fullmatch(r"-O[123sg]", a) or a == "-Ofast":
+            out.append("/O2")
+        elif a.startswith("-std="):
+            out.append("/std:" + map_std(a[len("-std="):]))
+        elif a == "-fopenmp-simd" or a == "-fopenmp":
+            out.append("/openmp:experimental")
+        elif a.startswith("-D"):
+            out.append("/D" + a[2:])
+        elif a.startswith("-I"):
+            out.append("/I" + a[2:])
+        elif a in DROP_EXACT or any(a.startswith(p) for p in DROP_PREFIX):
+            pass
+        elif a.startswith("/"):
+            out.append(a)          # already a cl flag -> pass through
+        elif a.startswith("-"):
+            sys.stderr.write("cl-proxy: dropping unknown flag '%s'\n" % a)
+        else:
+            out.append(a)          # source or object file
+        i += 1
+    return out, compiling, target
+
+
+def make_launcher(name, exe):
+    with open(name, "w") as f:
+        f.write("#!/bin/bash\n")
+        f.write("# Auto-generated by cl-proxy: run the MSVC-built binary and\n")
+        f.write("# normalize CRLF so its checksum matches other compilers.\n")
+        f.write("set -o pipefail\n")
+        f.write('"$(dirname "$0")/%s" "$@" | tr -d "\\r"\n' % exe)
+    os.chmod(name, 0o755)
+
+
+# Cache of the MSVC environment so we do not pay the ~25s vcvars cost per call.
+CACHE = os.environ.get("YARPGEN_MSVC_ENV_CACHE",
+                       os.path.expanduser("~/.cache/yarpgen_msvc_env.json"))
+
+
+def capture_msvc_env():
+    """Run vcvars once (via a .bat, to dodge cmd.exe quoting) and record cl.exe's
+    path plus the INCLUDE/LIB/LIBPATH it sets. Returns {} on failure."""
+    bat = "_clproxy_env_%d.bat" % os.getpid()
+    try:
+        with open(bat, "w", newline="\r\n") as f:
+            f.write("@echo off\n")
+            f.write('call "%s" >nul\n' % VCVARS)
+            f.write("set\n")
+        out = subprocess.check_output(["cmd.exe", "/C", bat],
+                                      stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    finally:
+        try:
+            os.remove(bat)
+        except OSError:
+            pass
+
+    env = {}
+    for line in out.decode("utf-8", "replace").splitlines():
+        if "=" in line:
+            k, v = line.rstrip("\r\n").split("=", 1)
+            env[k] = v
+    cl = None
+    for d in env.get("Path", env.get("PATH", "")).split(";"):
+        wd = win_path_to_wsl(d)
+        if wd and os.path.isfile(os.path.join(wd, "cl.exe")):
+            cl = os.path.join(wd, "cl.exe")
+            break
+    if not cl:
+        return {}
+    data = {"cl": cl,
+            "vars": {k: env[k] for k in ("INCLUDE", "LIB", "LIBPATH")
+                     if k in env}}
+    try:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with open(CACHE, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+    return data
+
+
+def load_msvc_env():
+    try:
+        with open(CACHE) as f:
+            data = json.load(f)
+        if data.get("cl") and os.path.isfile(data["cl"]):
+            return data
+    except (OSError, ValueError):
+        pass
+    return capture_msvc_env()
+
+
+def run_via_bat(cl_args):
+    """Slow fallback: run cl through cmd.exe + vcvars for every invocation."""
+    cl_cmd = "cl " + " ".join(cl_args)
+    bat = "_clproxy_%d.bat" % os.getpid()
+    with open(bat, "w", newline="\r\n") as f:
+        f.write("@echo off\n")
+        f.write('call "%s" >nul\n' % VCVARS)
+        f.write(cl_cmd + "\n")
+        f.write("exit /b %errorlevel%\n")
+    try:
+        return subprocess.call(["cmd.exe", "/C", bat])
+    finally:
+        try:
+            os.remove(bat)
+        except OSError:
+            pass
+
+
+def run_direct(data, cl_args):
+    """Fast path: invoke cl.exe directly, forwarding the cached INCLUDE/LIB/
+    LIBPATH to the Win32 process via WSLENV (verbatim, no path translation)."""
+    env = dict(os.environ)
+    for k, v in data["vars"].items():
+        env[k] = v
+    names = ":".join(data["vars"].keys())
+    if names:
+        prev = os.environ.get("WSLENV", "")
+        env["WSLENV"] = (prev + ":" + names) if prev else names
+    return subprocess.call([data["cl"]] + cl_args, env=env)
+
+
+def main():
+    args, compiling, target = translate(sys.argv[1:])
+    exe_out = None
+    if target is not None:
+        if compiling:
+            args.append("/Fo:" + target)
+        else:
+            exe_out = target + ".exe"
+            args.append("/Fe:" + exe_out)
+
+    data = load_msvc_env()
+    if data.get("cl"):
+        rc = run_direct(data, args)
+    else:
+        # Could not locate cl.exe; fall back to the slow cmd.exe + vcvars path.
+        rc = run_via_bat(args)
+
+    if rc == 0 and exe_out is not None:
+        make_launcher(target, exe_out)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
