@@ -99,6 +99,7 @@ class OptionParser {
     static void parseMutationKind(std::string mutate_str);
     static void parseMutationSeed(std::string mutation_seed_str);
     static void parseAllowUBInDC(std::string allow_ub_in_dc_str);
+    static void parseMaxArrayDims(std::string max_array_dims_str);
 };
 
 class Options {
@@ -168,6 +169,14 @@ class Options {
     void setAllowUBInDC(OptionLevel _val) { allow_ub_in_dc = _val; }
     OptionLevel getAllowUBInDC() { return allow_ub_in_dc; }
 
+    // Upper bound on the number of array dimensions. Zero means "no explicit
+    // limit" (the generator's own default applies). Lowering this shrinks the
+    // generated arrays, which is required to fit compilers without a
+    // large-memory model (e.g. MSVC, which has no -mcmodel=large and a 2GB
+    // image limit).
+    void setMaxArrayDims(size_t _val) { max_array_dims = _val; }
+    size_t getMaxArrayDims() { return max_array_dims; }
+
     void dump(std::ostream &stream);
 
   private:
@@ -179,7 +188,7 @@ class Options {
           emit_pragmas(OptionLevel::SOME), out_dir("."),
           use_param_shuffle(false), expl_loop_params(false),
           mutation_kind(MutationKind::NONE), mutation_seed(0),
-          allow_ub_in_dc(OptionLevel::NONE) {}
+          allow_ub_in_dc(OptionLevel::NONE), max_array_dims(0) {}
 
     std::vector<std::string> raw_options;
 
@@ -210,5 +219,8 @@ class Options {
 
     // If we want to allow Undefined Behavior in Dead Code
     OptionLevel allow_ub_in_dc;
+
+    // Upper bound on array dimensions (0 = no explicit limit).
+    size_t max_array_dims;
 };
 } // namespace yarpgen

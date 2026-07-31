@@ -63,7 +63,7 @@ script_start_time = datetime.datetime.now()  # We should init variable, so let's
 
 known_build_fails = { \
 # clang
-    "Assertion `NodeToMatch\-\>getOpcode\(\) != ISD::DELETED_NODE && \"NodeToMatch was removed partway through selection\"'": "SelectionDAGISel", \
+    r"Assertion `NodeToMatch\-\>getOpcode\(\) != ISD::DELETED_NODE && \"NodeToMatch was removed partway through selection\"'": "SelectionDAGISel", \
     "replaceAllUses of value with new value of different type": "replaceAllUses", \
     "Concatenation of vectors with inconsistent value types": "FoldCONCAT_VECTORS", \
     "Integer type overpromoted": "PromoteIntRes_SETCC", \
@@ -210,6 +210,14 @@ class Test(object):
                             "--std=" + common.StdID.get_pretty_std_name(common.selected_standard)]
         if seed:
             yarpgen_run_list += ["-s", seed]
+        # MSVC (driven via cl-proxy) has no large-memory model and a 2GB image
+        # limit, so the default multi-GB arrays won't link. When an MSVC target
+        # is selected, cap the array dimensions so the shared test fits.
+        msvc_selected = any(
+            getattr(t.specs, "comp_cxx_name", "") == "cl-proxy"
+            for t in gen_test_makefile.CompilerTarget.all_targets)
+        if msvc_selected:
+            yarpgen_run_list.append("--max-array-dims=3")
         self.yarpgen_cmd = " ".join(str(p) for p in yarpgen_run_list)
         self.ret_code, self.stdout, self.stderr, self.is_time_expired, self.elapsed_time = \
             common.run_cmd(yarpgen_run_list, yarpgen_timeout, proc_num, yarpgen_mem_limit)
@@ -512,10 +520,10 @@ class Test(object):
             init_h.close()
             init_h = open("init.h", "w")
             for l in init_h_content:
-                if not (remove_iostream and re.search("\<iostream\>", l) or \
-                        remove_array and re.search("\<array\>", l) or \
-                        remove_vector and re.search("\<vector\>", l) or \
-                        remove_valarray and re.search("\<valarray\>", l)):
+                if not (remove_iostream and re.search(r"\<iostream\>", l) or \
+                        remove_array and re.search(r"\<array\>", l) or \
+                        remove_vector and re.search(r"\<vector\>", l) or \
+                        remove_valarray and re.search(r"\<valarray\>", l)):
                     init_h.write(l)
             init_h.close()
 
@@ -1451,7 +1459,7 @@ def check_creduce_version():
     try:
         ret_code, stdout, stderr, time_expired, elapsed_time = common.run_cmd([creduce_bin, "--help"], yarpgen_timeout, 0)
         stdout_str = str(stdout, "utf-8")
-        match = re.match("creduce (\d+)\.(\d+)\.(\d+).*", stdout_str)
+        match = re.match(r"creduce (\d+)\.(\d+)\.(\d+).*", stdout_str)
         if not match:
             common.print_and_exit("Can't read creduce version.")
         major = int(match.group(1))

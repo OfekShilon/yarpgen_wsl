@@ -359,6 +359,11 @@ GenPolicy::GenPolicy() {
     if (options.isISPC())
         array_dims_num_limit = 4;
 
+    // An explicit cap (e.g. for MSVC, which lacks a large-memory model) wins.
+    if (options.getMaxArrayDims() != 0)
+        array_dims_num_limit =
+            std::min(array_dims_num_limit, options.getMaxArrayDims());
+
     // Arrays with single dimension require a separate treatment. Otherwise, we
     // do not get the desired distribution.
     stencil_in_dim_prob.emplace(

@@ -97,6 +97,17 @@ static void emitVarsDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
     ctx->setSYCLPrefix("");
 }
 
+// Emit an alignment specifier as a declaration *prefix*. We use the standard
+// C++11 `alignas`, which GCC, Clang and MSVC all accept. MSVC does not accept
+// the trailing GNU `__attribute__((aligned(...)))`, and its `__declspec` is a
+// prefix specifier, so a prefix `alignas` is the portable choice. For C we keep
+// the GNU attribute (MSVC support is C++ only).
+static std::string alignAttr(size_t alignment) {
+    if (Options::getInstance().isC())
+        return "__attribute__((aligned(" + std::to_string(alignment) + ")))";
+    return "alignas(" + std::to_string(alignment) + ")";
+}
+
 static void emitArrayDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
                           std::vector<std::shared_ptr<Array>> arrays) {
     Options &options = Options::getInstance();
@@ -106,14 +117,13 @@ static void emitArrayDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         auto type = array->getType();
         assert(type->isArrayType() && "Array should have an Array type");
         auto array_type = std::static_pointer_cast<ArrayType>(type);
+        if (array->getAlignment() != 0)
+            stream << alignAttr(array->getAlignment()) << " ";
         stream << array_type->getBaseType()->getName(ctx) << " ";
         stream << array->getName(ctx) << " ";
         for (const auto &dimension : array_type->getDimensions()) {
             stream << "[" << dimension << "] ";
         }
-        if (array->getAlignment() != 0)
-            stream << "__attribute__((aligned(" << array->getAlignment()
-                   << ")))";
         stream << ";\n";
     }
 }
@@ -325,14 +335,10 @@ static void emitArrayExtDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         auto type = array->getType();
         assert(type->isArrayType() && "Array should have an Array type");
         auto array_type = std::static_pointer_cast<ArrayType>(type);
-        stream << "extern ";
-        stream << array_type->getBaseType()->getName(ctx);
-        stream << " ";
-        stream << array->getName(ctx) << " ";
-        for (const auto &dimension : array_type->getDimensions()) {
-            stream << "[" << dimension << "] ";
-        }
 
+        // Decide on the alignment before emitting the declaration: the
+        // alignment specifier has to be emitted as a prefix (see alignAttr).
+        size_t alignment = 0;
         if (options.isCXX() &&
             options.getEmitAlignAttr() != OptionLevel::NONE) {
             bool emit_align_attr = true;
@@ -344,7 +350,6 @@ static void emitArrayExtDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
                 if (!options.getUniqueAlignSize())
                     align_size =
                         rand_val_gen->getRandId(emit_pol->align_size_distr);
-                size_t alignment = 0;
                 switch (align_size) {
                     case AlignmentSize::A16:
                         alignment = 16;
@@ -359,10 +364,21 @@ static void emitArrayExtDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
                         ERROR("Bad alignment size");
                 }
                 array->setAlignment(alignment);
-                stream << "__attribute__((aligned(" << alignment << ")))";
             }
         }
 
+        // The alignment specifier must precede all decl-specifiers (i.e. come
+        // before `extern`); placing it between `extern` and the type is
+        // ill-formed for a standard attribute.
+        if (alignment != 0)
+            stream << alignAttr(alignment) << " ";
+        stream << "extern ";
+        stream << array_type->getBaseType()->getName(ctx);
+        stream << " ";
+        stream << array->getName(ctx) << " ";
+        for (const auto &dimension : array_type->getDimensions()) {
+            stream << "[" << dimension << "] ";
+        }
         stream << ";\n";
     }
 }

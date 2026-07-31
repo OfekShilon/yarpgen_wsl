@@ -163,6 +163,7 @@ enum class OptionKind {
     MUTATE,
     MUTATION_SEED,
     UB_IN_DC,
+    MAX_ARRAY_DIMS,
     MAX_OPTION_ID
 };
 
