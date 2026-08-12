@@ -56,6 +56,15 @@ If you want to test [ISPC](https://ispc.github.io/), make sure that it is presen
 [``ispc-proxy``](scripts/ispc-proxy) and [``ispc-disp``](scripts/ispc-disp). After that you can use
 [``run_gen.py``](scripts/run_gen.py)  with ``--std=ispc`` as usual.
 
+MSVC testing
+------------
+
+MSVC can be tested from WSL, with ``cl.exe`` installed on the Windows host and driven
+through [``cl-proxy``](scripts/cl-proxy) — the same shim idea as ``ispc-proxy``. This needs
+its own testing sets ([``test_sets_msvc.txt``](scripts/test_sets_msvc.txt), passed via
+``--config-file``) and has a few environment requirements, so see
+[``README-msvc-wsl.md``](scripts/README-msvc-wsl.md) for the details.
+
 Contacts
 --------
 

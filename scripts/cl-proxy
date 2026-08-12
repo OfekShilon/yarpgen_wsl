@@ -11,7 +11,14 @@
 # counterpart of ispc-proxy / ispc-disp.
 #
 # It does three things:
-#   1. Translates the GCC-style flags the harness emits into cl.exe syntax.
+#   1. Translates the few GCC-style flags the scripts generate (-c, -o, -std=,
+#      -D, -I) into cl.exe syntax, and drops GCC-only flags that have no MSVC
+#      equivalent.
+#      It deliberately does NOT translate optimization or feature flags: what
+#      you write in the testing-set config is what cl.exe gets. Spell those
+#      flags the MSVC way (/Od, /O1, /O2, /Os, /Ot, /arch:AVX2, ...); they are
+#      passed through verbatim. A GCC-style flag it does not recognize is a
+#      hard error rather than something silently dropped or reinterpreted.
 #   2. Invokes cl.exe through cmd.exe with the MSVC environment loaded
 #      (vcvars64.bat).
 #   3. Wraps the produced Windows .exe in a tiny shell launcher that also
@@ -97,8 +104,18 @@ def map_std(std):
     return table.get(std, "c++17")
 
 
+class UnknownFlag(Exception):
+    def __init__(self, flag):
+        Exception.__init__(self, flag)
+        self.flag = flag
+
+
 def translate(argv):
-    """GCC-style argv -> (cl args, is_compile_only, output_target)."""
+    """GCC-style argv -> (cl args, is_compile_only, output_target).
+
+    Only the flags generated in code are rewritten; '/'-prefixed flags from the
+    config are passed through untouched.
+    """
     out = ["/nologo", "/EHsc", "/w", "/permissive-"]
     compiling = "-c" in argv
     target = None
@@ -110,14 +127,8 @@ def translate(argv):
         elif a == "-o":
             i += 1
             target = argv[i]
-        elif a == "-O0":
-            out.append("/Od")
-        elif re.fullmatch(r"-O[123sg]", a) or a == "-Ofast":
-            out.append("/O2")
         elif a.startswith("-std="):
             out.append("/std:" + map_std(a[len("-std="):]))
-        elif a == "-fopenmp-simd" or a == "-fopenmp":
-            out.append("/openmp:experimental")
         elif a.startswith("-D"):
             out.append("/D" + a[2:])
         elif a.startswith("-I"):
@@ -127,7 +138,7 @@ def translate(argv):
         elif a.startswith("/"):
             out.append(a)          # already a cl flag -> pass through
         elif a.startswith("-"):
-            sys.stderr.write("cl-proxy: dropping unknown flag '%s'\n" % a)
+            raise UnknownFlag(a)
         else:
             out.append(a)          # source or object file
         i += 1
@@ -236,7 +247,13 @@ def run_direct(data, cl_args):
 
 
 def main():
-    args, compiling, target = translate(sys.argv[1:])
+    try:
+        args, compiling, target = translate(sys.argv[1:])
+    except UnknownFlag as e:
+        sys.stderr.write(
+            "cl-proxy: unknown flag '%s'.\n" % e.flag)
+        return 2
+
     exe_out = None
     if target is not None:
         if compiling:
