@@ -32,7 +32,35 @@ run_gen.py --std c++ \
 ```
 
 `run_gen.py` automatically passes `--max-array-dims=3` to the generator whenever
-an MSVC target is selected (see below).
+an MSVC target is selected (see [Why the array-dimension
+cap](#why-the-array-dimension-cap)).
+
+## Testing sets
+
+MSVC runs off its own config, [`test_sets_msvc.txt`](test_sets_msvc.txt), passed
+with `--config-file`; the default `test_sets.txt` has no MSVC entries. You can:
+
+- **Add a set** to widen the search. Spell the flags the MSVC way (`/O2 /Qpar`).
+- **Comment a set out** to get through more programs. At the 8 sets shipped here
+  each program costs 8 compiles and 8 runs; halving that roughly doubles the
+  number of programs a night's run covers.
+
+Every shipped set pins `/std:c++20` explicitly, and you can modify it or add sets
+with a different value. Without the explicit switches gcc compiles
+C++11 while MSVC compiles C++14.
+
+## Speed: exclude the work folder from Defender
+
+Microsoft Defender's real-time scanning dominates the run time of this setup.
+Exclude the scratch directory — elevated PowerShell, on the Windows side:
+
+```powershell
+Add-MpPreference -ExclusionPath 'C:\yarpgen-scratch'
+Get-MpPreference | Select-Object -ExpandProperty ExclusionPath   # verify
+```
+
+Keep this to a directory used for nothing else: files under an excluded path are
+no longer scanned at all.
 
 ## Why the array-dimension cap
 
