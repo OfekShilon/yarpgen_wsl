@@ -118,6 +118,11 @@ def translate(argv):
     """
     out = ["/nologo", "/EHsc", "/w", "/permissive-"]
     compiling = "-c" in argv
+    # A testing set may pin the standard itself (/std:c++20). That is more
+    # specific than the -std= the harness derives from --std, so let it win
+    # outright instead of emitting both and relying on cl's last-one-wins
+    # (which also costs a D9025 override warning per compile).
+    explicit_std = any(a.startswith("/std:") for a in argv)
     target = None
     i = 0
     while i < len(argv):
@@ -128,7 +133,8 @@ def translate(argv):
             i += 1
             target = argv[i]
         elif a.startswith("-std="):
-            out.append("/std:" + map_std(a[len("-std="):]))
+            if not explicit_std:
+                out.append("/std:" + map_std(a[len("-std="):]))
         elif a.startswith("-D"):
             out.append("/D" + a[2:])
         elif a.startswith("-I"):
