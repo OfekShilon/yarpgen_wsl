@@ -22,14 +22,17 @@ presents a GCC/Clang-style command line and forwards to MSVC — the same idea a
 
 For a 1h run:
 ```sh
-export PATH="/path/to/yarpgen/scripts:$PATH"
-cd /mnt/c/some/scratch/dir
-run_gen.py --std c++ -o /mnt/c/some/scratch/dir/testing --target "gcc clang msvc" -t 60
+export YARPGEN_HOME=/path/to/yarpgen          # else run_gen.py warns and assumes $PWD
+export PATH="$YARPGEN_HOME/scripts:$PATH"
+
+mkdir -p /mnt/c/yarpgen-scratch && cd /mnt/c/yarpgen-scratch
+run_gen.py --std c++ \
+           --config-file "$YARPGEN_HOME/scripts/test_sets_msvc.txt" \
+           -o testing --target "gcc msvc" -t 60      # -t is in minutes
 ```
 
 `run_gen.py` automatically passes `--max-array-dims=3` to the generator whenever
-an MSVC target is selected (see below). The MSVC compiler spec and the
-`msvc_no_opt` / `msvc_opt` testing sets live in [`test_sets.txt`](test_sets.txt).
+an MSVC target is selected (see below).
 
 ## Why the array-dimension cap
 
@@ -45,7 +48,7 @@ shared test fits every compiler. Tune the value if you want larger arrays.
 `cl.exe` keeps alive some language extensions and known bugs to allow for backwards
 compatibility. yarpgen's intended usage is to find unknown compiler bugs, so we wish 
 to filter those out. To that end, `cl-proxy` hardcodes `/permissive-` on 
-every `cl.exe` invocation ([cl-proxy:102](cl-proxy#L102)). This turns off MSVC's 
+every `cl.exe` invocation ([cl-proxy:124](cl-proxy#L124)). This turns off MSVC's 
 non-conforming language extensions.
 
 MSVC does enable `/permissive-` implicitly under `/std:c++20` and `/std:c++latest`, 
@@ -59,10 +62,18 @@ environment knob for it.
 
 ## How cl-proxy works
 
-1. **Flag translation** — `-c`→`/c`, `-o X`→`/Fo:X` (compile) or `/Fe:X.exe`
-   (link), `-O0`→`/Od`, `-O2/3`→`/O2`, `-std=c++NN`→`/std:...`, and it drops
-   flags MSVC has no use for (`-fPIC`, `-mcmodel=large`, `-march=...`, ...).
-   Every invocation also gets `/nologo /EHsc /w /permissive-` (see below).
+1. **Flag translation** — only the structural flags the *harness* generates are
+   rewritten: `-c`→`/c`, `-o X`→`/Fo:X` (compile) or `/Fe:X.exe` (link),
+   `-std=c++NN`→`/std:...`, `-D`/`-I`→`/D`/`/I`. It also drops flags MSVC has no
+   use for (`-fPIC`, `-mcmodel=large`, `-march=...`, ...). Every invocation gets
+   `/nologo /EHsc /w /permissive-` (see above).
+
+   Optimization and feature flags are **not** translated. Write them the MSVC
+   way in the config (`/Od`, `/O1`, `/O2`, `/Os`, `/Ot`, `/arch:AVX2`, ...) and
+   they reach `cl.exe` verbatim; an unrecognized GCC-style flag is a hard error
+   (exit 2), so a set never silently builds at an optimization level other than
+   the one it names. Note that `cl.exe` merely warns (D9002) on an unknown
+   `/`-flag, so a typo like `/0d` still gets you a default-optimization build.
 2. **Environment caching** — `vcvars64.bat` takes ~25 s, so running it per
    compile is unworkable. On first use `cl-proxy` captures the MSVC environment
    once into `~/.cache/yarpgen_msvc_env.json` (override with
