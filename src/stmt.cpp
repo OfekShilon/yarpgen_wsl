@@ -90,6 +90,7 @@ void DeclStmt::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
                     std::string offset) {
     stream << offset;
     // TODO: we need to do the right thing here
+    stream << cvQualifierPrefix(data->getDeclCVQualifier());
     stream << data->getType()->getName(ctx) << " ";
     stream << data->getName(ctx);
     if (init_expr.use_count() != 0) {
@@ -136,6 +137,11 @@ StmtBlock::generateStructure(std::shared_ptr<GenCtx> ctx) {
         // stmt)
         fallback |= stmt_kind == IRNodeKind::LOOP_NEST &&
                     (stats.getStmtNum() + 3 >= gen_policy->stmt_num_lim);
+        // A switch creates one scope per case plus an optional default.
+        fallback |= stmt_kind == IRNodeKind::SWITCH &&
+                    (stats.getStmtNum() +
+                         gen_policy->switch_case_num_distr.size() + 2 >=
+                     gen_policy->stmt_num_lim);
         if (fallback)
             break;
 
@@ -149,6 +155,9 @@ StmtBlock::generateStructure(std::shared_ptr<GenCtx> ctx) {
         else if (stmt_kind == IRNodeKind::IF_ELSE &&
                  ctx->getIfElseDepth() + 1 <= gen_policy->if_else_depth_limit)
             new_stmt = IfElseStmt::generateStructure(ctx);
+        else if (stmt_kind == IRNodeKind::SWITCH &&
+                 ctx->getIfElseDepth() + 1 <= gen_policy->if_else_depth_limit)
+            new_stmt = SwitchStmt::generateStructure(ctx);
         else {
             new_stmt = StubStmt::generateStructure(ctx);
             stats.addStmt();
@@ -192,38 +201,108 @@ void LoopHead::emitPrefix(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         prefix->emit(ctx, stream, std::move(offset));
 }
 
+// Emit one of an iterator's parameter expressions (start / end / step). Unless
+// --expl-loop-params was requested we emit the expression plus its value as a
+// comment; with the option we emit only the value.
+static void emitIterParam(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                          const std::shared_ptr<Expr> &expr) {
+    Options &options = Options::getInstance();
+    if (!options.getExplLoopParams())
+        expr->emit(ctx, stream);
+    EvalCtx eval_ctx;
+    // TODO: do we want to recalculate it every time?
+    auto eval_res = expr->evaluate(eval_ctx);
+    assert(eval_res->isScalarVar() && "Iterator should have a scalar value");
+    IRValue val =
+        std::static_pointer_cast<ScalarVar>(eval_res)->getCurrentValue();
+    if (!options.getExplLoopParams())
+        stream << "/*";
+    stream << val;
+    if (!options.getExplLoopParams())
+        stream << "*/";
+}
+
+// The concrete value of an iterator parameter, for the arithmetic that sizes a
+// break/continue guard.
+static int64_t iterParamValue(const std::shared_ptr<Expr> &expr) {
+    EvalCtx eval_ctx;
+    auto eval_res = expr->evaluate(eval_ctx);
+    assert(eval_res->isScalarVar() && "Iterator should have a scalar value");
+    IRValue val =
+        std::static_pointer_cast<ScalarVar>(eval_res)->getCurrentValue();
+    auto abs_val = val.getAbsValue();
+    return abs_val.isNegative ? -static_cast<int64_t>(abs_val.value)
+                              : static_cast<int64_t>(abs_val.value);
+}
+
+void LoopHead::emitCondition(std::shared_ptr<EmitCtx> ctx,
+                             std::ostream &stream) {
+    for (auto iter = iters.begin(); iter != iters.end(); ++iter) {
+        stream << (*iter)->getName(ctx) << " < ";
+        emitIterParam(ctx, stream, (*iter)->getEnd());
+        if (iter != iters.end() - 1)
+            stream << ", ";
+    }
+}
+
+void LoopHead::emitIterDecls(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                             std::string offset) {
+    for (const auto &iter : iters) {
+        stream << offset << iter->getType()->getName(ctx) << " "
+               << iter->getName(ctx) << " = ";
+        emitIterParam(ctx, stream, iter->getStart());
+        stream << ";\n";
+    }
+}
+
+void LoopHead::emitIterSteps(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                             std::string offset) {
+    for (const auto &iter : iters) {
+        stream << offset << iter->getName(ctx) << " += ";
+        emitIterParam(ctx, stream, iter->getStep());
+        stream << ";\n";
+    }
+}
+
 void LoopHead::emitHeader(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
                           std::string offset) {
     if (vectorizable)
         stream << offset << "/* vectorizable */\n";
-    if (!pragmas.empty()) {
+
+    auto emit_pragmas = [this, &ctx, &stream, &offset]() {
         for (auto &pragma : pragmas) {
             pragma->emit(ctx, stream, offset);
             stream << "\n";
         }
+    };
+
+    // A while/do-while form has to hoist the iterator declarations out of the
+    // loop, so it needs an enclosing scope to keep their names local.
+    if (form != LoopForm::FOR) {
+        stream << offset << "{\n";
+        emitIterDecls(ctx, stream, offset);
+        // A loop pragma has to sit immediately in front of the loop it applies
+        // to, so it goes after the hoisted declarations, not before the scope.
+        emit_pragmas();
+        stream << offset;
+        if (form == LoopForm::WHILE) {
+            stream << "while (";
+            emitCondition(ctx, stream);
+            stream << ") ";
+        }
+        else {
+            stream << "do ";
+        }
+        if (same_iter_space)
+            stream << "/* same iter space */";
+        return;
     }
 
+    emit_pragmas();
     stream << offset;
 
     auto place_sep = [this](auto iter, std::string sep) -> std::string {
         return iter != iters.end() - 1 ? std::move(sep) : "";
-    };
-
-    Options &options = Options::getInstance();
-
-    auto emit_iter_param_val = [&stream, &options](std::shared_ptr<Expr> expr) {
-        EvalCtx eval_ctx;
-        // TODO: do we want to recalculate it every time?
-        auto eval_res = expr->evaluate(eval_ctx);
-        assert(eval_res->isScalarVar() &&
-               "Iterator should have a scalar value");
-        auto scalar_eval_res = std::static_pointer_cast<ScalarVar>(eval_res);
-        IRValue val = scalar_eval_res->getCurrentValue();
-        if (!options.getExplLoopParams())
-            stream << "/*";
-        stream << val;
-        if (!options.getExplLoopParams())
-            stream << "*/";
     };
 
     if (!isForeach()) {
@@ -232,30 +311,17 @@ void LoopHead::emitHeader(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         for (auto iter = iters.begin(); iter != iters.end(); ++iter) {
             stream << (*iter)->getType()->getName(ctx) << " ";
             stream << (*iter)->getName(ctx) << " = ";
-            auto start = (*iter)->getStart();
-            if (!options.getExplLoopParams())
-                start->emit(ctx, stream);
-            emit_iter_param_val(start);
+            emitIterParam(ctx, stream, (*iter)->getStart());
             stream << place_sep(iter, ", ");
         }
         stream << "; ";
 
-        for (auto iter = iters.begin(); iter != iters.end(); ++iter) {
-            stream << (*iter)->getName(ctx) << " < ";
-            auto end = (*iter)->getEnd();
-            if (!options.getExplLoopParams())
-                end->emit(ctx, stream);
-            emit_iter_param_val(end);
-            stream << place_sep(iter, ", ");
-        }
+        emitCondition(ctx, stream);
         stream << "; ";
 
         for (auto iter = iters.begin(); iter != iters.end(); ++iter) {
             stream << (*iter)->getName(ctx) << " += ";
-            auto step = (*iter)->getStep();
-            if (!options.getExplLoopParams())
-                step->emit(ctx, stream);
-            emit_iter_param_val(step);
+            emitIterParam(ctx, stream, (*iter)->getStep());
             stream << place_sep(iter, ", ");
         }
         stream << ") ";
@@ -265,15 +331,9 @@ void LoopHead::emitHeader(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
 
         for (auto iter = iters.begin(); iter != iters.end(); ++iter) {
             stream << (*iter)->getName(ctx) << " = (";
-            auto start = (*iter)->getStart();
-            if (!options.getExplLoopParams())
-                start->emit(ctx, stream);
-            emit_iter_param_val(start);
+            emitIterParam(ctx, stream, (*iter)->getStart());
             stream << ")...(";
-            auto end = (*iter)->getEnd();
-            if (!options.getExplLoopParams())
-                end->emit(ctx, stream);
-            emit_iter_param_val(end);
+            emitIterParam(ctx, stream, (*iter)->getEnd());
             stream << ")";
             stream << place_sep(iter, ", ");
         }
@@ -283,6 +343,171 @@ void LoopHead::emitHeader(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
 
     if (same_iter_space)
         stream << "/* same iter space */";
+}
+
+void LoopHead::emitBodyStart(std::shared_ptr<EmitCtx> ctx,
+                            std::ostream &stream, std::string offset) {
+    if (jump_kind == LoopJumpKind::NONE)
+        return;
+
+    auto iter = iters.front();
+    auto int_type = std::static_pointer_cast<IntegralType>(iter->getType());
+    IRValue bound(int_type->getIntTypeId(),
+                  IRValue::AbsValue{jump_bound < 0,
+                                    static_cast<uint64_t>(
+                                        jump_bound < 0 ? -jump_bound
+                                                       : jump_bound)});
+    auto bound_expr = std::make_shared<ConstantExpr>(bound);
+
+    stream << offset << "if (" << iter->getName(ctx);
+    // BREAK leaves once the iterator reaches the bound; both continue kinds
+    // skip while it is still below it.
+    stream << (jump_kind == LoopJumpKind::BREAK ? " >= " : " < ");
+    stream << "(";
+    bound_expr->emit(ctx, stream);
+    stream << ")";
+    if (hide_jump_bound)
+        stream << " + zero";
+    stream << ") " << (jump_kind == LoopJumpKind::BREAK ? "break" : "continue")
+           << ";\n";
+}
+
+void LoopHead::emitBodyEnd(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                           std::string offset) {
+    // Only the while/do-while forms carry their update in the body.
+    if (form == LoopForm::FOR)
+        return;
+    emitIterSteps(ctx, stream, std::move(offset));
+}
+
+void LoopHead::emitFooter(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                          std::string offset) {
+    if (form == LoopForm::FOR)
+        return;
+    if (form == LoopForm::DO_WHILE) {
+        stream << offset << "while (";
+        emitCondition(ctx, stream);
+        stream << ");\n";
+    }
+    // Close the scope that emitHeader() opened for the hoisted declarations.
+    stream << offset << "}\n";
+}
+
+void LoopHead::copyFormAndJump(const std::shared_ptr<LoopHead> &other) {
+    form = other->form;
+    jump_kind = other->jump_kind;
+    jump_bound = other->jump_bound;
+    hide_jump_bound = other->hide_jump_bound;
+}
+
+void LoopHead::chooseFormAndJump(const std::shared_ptr<PopulateCtx> &ctx) {
+    Options &options = Options::getInstance();
+    if (!options.extendedFeaturesSupported() || isForeach())
+        return;
+    // A head with several iterators spells its condition and update as comma
+    // expressions, which have no while/do-while equivalent, and a guard on one
+    // of several iterators is not what we want either.
+    if (iters.size() != 1)
+        return;
+
+    auto gen_pol = ctx->getGenPolicy();
+    auto iter = iters.front();
+    size_t total = iter->getTotalItersNum();
+
+    // OpenMP's `simd` construct must be attached to a canonical for loop, and
+    // branching out of it is forbidden, so such a loop keeps both the for form
+    // and an unguarded body.
+    if (hasSIMDPragma())
+        return;
+
+    if (options.getLoopForms() != OptionLevel::NONE) {
+        LoopForm rolled =
+            options.getLoopForms() == OptionLevel::ALL
+                ? LoopForm::WHILE
+                : rand_val_gen->getRandId(gen_pol->loop_form_distr);
+        // do-while runs the body unconditionally once, so it cannot express a
+        // loop that must not run at all. A degenerate loop's body is populated
+        // as dead code and may even contain UB (--allow-ub-in-dc), so executing
+        // it would be a real bug.
+        if (rolled == LoopForm::DO_WHILE &&
+            (iter->isDegenerate() || total == 0))
+            rolled = LoopForm::WHILE;
+        form = rolled;
+    }
+
+    if (options.getLoopJumps() == OptionLevel::NONE)
+        return;
+    // Nothing to guard, and the body is dead code.
+    if (iter->isDegenerate() || total == 0)
+        return;
+
+    LoopJumpKind rolled = rand_val_gen->getRandId(gen_pol->loop_jump_distr);
+    if (rolled == LoopJumpKind::NONE)
+        return;
+    bool is_continue = rolled != LoopJumpKind::BREAK;
+
+    // In a while/do-while form the iterator update sits at the end of the body,
+    // and `continue` would jump over it -- an infinite loop. In a `for` the
+    // update is part of the header, which `continue` does run.
+    if (is_continue && form != LoopForm::FOR)
+        return;
+
+    // BREAK and CONT_PREFIX shorten the trip count. Only the default HASH
+    // algorithm compares hashes between compilers; the other two embed values
+    // that yarpgen predicted, and a shorter loop leaves more of an array
+    // holding its initial values than the single-value-per-array model
+    // assumes. CONT_NEVER does not touch the trip count, so it stays allowed.
+    if (options.getCheckAlgo() != CheckAlgo::HASH &&
+        rolled != LoopJumpKind::CONT_NEVER)
+        return;
+
+    int64_t start = iterParamValue(iter->getStart());
+    int64_t step = iterParamValue(iter->getStep());
+    if (step <= 0)
+        return;
+
+    hide_jump_bound = rand_val_gen->getRandId(gen_pol->hide_jump_bound_distr);
+
+    if (rolled == LoopJumpKind::BREAK) {
+        size_t percent =
+            rand_val_gen->getRandId(gen_pol->break_keep_percent_distr);
+        size_t keep = (total * percent) / 100;
+        keep = std::min(std::max(keep, static_cast<size_t>(1)), total);
+        jump_kind = LoopJumpKind::BREAK;
+        // The guard fires on the first iteration whose value reaches the bound.
+        // keep == total puts the bound one step past the final iteration, so
+        // the exit exists but is never taken -- the shape that stresses
+        // early-exit vectorization hardest, at no cost to the value model.
+        jump_bound = start + static_cast<int64_t>(keep) * step;
+        if (keep != total) {
+            iter->setTotalItersNum(keep);
+            // The final executed iteration moved, so which of an array's two
+            // value sets it reads may have moved with it.
+            int64_t last = start + static_cast<int64_t>(keep - 1) * step;
+            iter->setMainValsOnLastIter(
+                static_cast<size_t>(last) % Options::vals_number ==
+                Options::main_val_idx);
+        }
+    }
+    else if (rolled == LoopJumpKind::CONT_NEVER) {
+        jump_kind = LoopJumpKind::CONT_NEVER;
+        // `i < start` is false on every iteration. This only earns its keep
+        // when the bound is opaque; otherwise the compiler deletes the guard.
+        jump_bound = start;
+        hide_jump_bound = true;
+    }
+    else {
+        size_t skip = rand_val_gen->getRandId(gen_pol->cont_skip_num_distr);
+        // Keep at least the final iteration, so that the last write to every
+        // scalar target is the one the value model predicted.
+        if (skip >= total)
+            skip = total - 1;
+        if (skip == 0)
+            return;
+        jump_kind = LoopJumpKind::CONT_PREFIX;
+        jump_bound = start + static_cast<int64_t>(skip) * step;
+        iter->setTotalItersNum(total - skip);
+    }
 }
 
 void LoopHead::emitSuffix(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
@@ -340,7 +565,15 @@ void LoopSeqStmt::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         loop.first->emitPrefix(ctx, stream, offset);
         loop.first->emitHeader(ctx, stream, offset);
         stream << "\n";
-        loop.second->emit(ctx, stream, offset);
+        // We emit the body's braces here rather than letting the ScopeStmt do
+        // it, because the loop needs to place its break/continue guard and (for
+        // the while/do-while forms) its iterator update inside them.
+        stream << offset << "{\n";
+        loop.first->emitBodyStart(ctx, stream, offset + "    ");
+        loop.second->emitBody(ctx, stream, offset + "    ");
+        loop.first->emitBodyEnd(ctx, stream, offset + "    ");
+        stream << offset << "}\n";
+        loop.first->emitFooter(ctx, stream, offset);
         loop.first->emitSuffix(ctx, stream, offset);
     }
 }
@@ -449,6 +682,11 @@ void LoopSeqStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
                 new_dim = new_ctx->getDimensions().front();
 
             new_iters = loop_head->populateIterators(new_ctx, new_dim);
+            // Must run after createPragmas() (an omp simd loop may not be
+            // branched out of) and before the body is populated, because
+            // shortening the trip count changes the values that reductions in
+            // the body evaluate to.
+            loop_head->chooseFormAndJump(new_ctx);
         }
         else {
             new_dim = same_iter_space_dim;
@@ -473,6 +711,9 @@ void LoopSeqStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
                                     loop_head->isForeach());
 
             loop_head->addIterator(new_iters);
+            // new_iters was cloned from prev_iter, trip count included. That
+            // count is only correct if this loop carries the same guard.
+            loop_head->copyFormAndJump(prev_loop.first);
             loop_head->setSameIterSpace();
             same_iter_space_counter--;
         }
@@ -538,16 +779,23 @@ void LoopNestStmt::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         loop->emitPrefix(ctx, stream, new_offset);
         loop->emitHeader(ctx, stream, new_offset);
         stream << "\n" << new_offset << "{\n";
+        // The guard belongs to this loop, so it goes before the next header.
+        loop->emitBodyStart(ctx, stream, new_offset + "    ");
         new_offset += "    ";
     }
 
     body->emit(ctx, stream, new_offset);
-    new_offset.erase(new_offset.size() - 4, 4);
 
-    for (const auto &loop : loops) {
-        stream << new_offset << "} \n";
-        loop->emitSuffix(ctx, stream, new_offset);
+    // Close from the innermost loop outwards. Each loop's iterator update has
+    // to come after every loop nested inside it has been closed, so this walks
+    // the loops in reverse -- the previous forward walk paired each closing
+    // brace with the wrong LoopHead.
+    for (auto loop = loops.rbegin(); loop != loops.rend(); ++loop) {
+        (*loop)->emitBodyEnd(ctx, stream, new_offset);
         new_offset.erase(new_offset.size() - 4, 4);
+        stream << new_offset << "} \n";
+        (*loop)->emitFooter(ctx, stream, new_offset);
+        (*loop)->emitSuffix(ctx, stream, new_offset);
     }
 }
 
@@ -624,6 +872,7 @@ void LoopNestStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
             new_dim = new_ctx->getDimensions().front();
 
         auto new_iters = (*i)->populateIterators(new_ctx, new_dim);
+        (*i)->chooseFormAndJump(new_ctx);
 
         bool body_with_mul_vals =
             new_ctx->getMulValsIter() == nullptr &&
@@ -707,7 +956,13 @@ void IfElseStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
     // the current implementation of value tracking
     cond = ArithmeticExpr::create(new_ctx);
 
-    if (!cond->getValue()->isScalarVar()) {
+    // ArithmeticExpr::create() only propagates types as part of eliminating UB,
+    // and it skips both for dead code when --allow-ub-in-dc permits UB there.
+    // Without this the condition has no value at all and the check below
+    // dereferences null.
+    cond->propagateType();
+
+    if (!cond->getValue()->isScalarVar() && !cond->getValue()->isTypedData()) {
         ERROR("Can perform conversion to bool only on scalar variables");
     }
 
@@ -736,6 +991,247 @@ void IfElseStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
         new_ctx->setTaken(ctx->isTaken() && !cond_taken);
         else_br->populate(new_ctx);
     }
+}
+
+// Produce `base + delta` as a value of type_id, or report failure if it would
+// leave the type's range.
+//
+// This has to be done in plain integers: IRValue's arithmetic operators are
+// only defined for the types that survive integral promotion (int and wider),
+// because everywhere else in the generator they are applied to
+// already-promoted operands. Case labels are generated in the condition's own
+// (possibly narrow) type so that they are trivially in range of the promoted
+// type used for the comparison.
+static bool denseLabel(IntTypeID type_id, IRValue base, size_t delta,
+                       IRValue &out) {
+    auto int_type = IntegralType::init(type_id);
+    auto to_signed = [](IRValue v) {
+        auto abs_val = v.getAbsValue();
+        return abs_val.isNegative ? -static_cast<int64_t>(abs_val.value)
+                                  : static_cast<int64_t>(abs_val.value);
+    };
+
+    if (int_type->getIsSigned()) {
+        int64_t hi = to_signed(int_type->getMax());
+        int64_t val = to_signed(base);
+        if (val > hi - static_cast<int64_t>(delta))
+            return false;
+        val += static_cast<int64_t>(delta);
+        out = IRValue(type_id,
+                      IRValue::AbsValue{val < 0, static_cast<uint64_t>(
+                                                     val < 0 ? -val : val)});
+    }
+    else {
+        uint64_t hi = int_type->getMax().getAbsValue().value;
+        uint64_t val = base.getAbsValue().value;
+        if (val > hi - delta)
+            return false;
+        out = IRValue(type_id, IRValue::AbsValue{false, val + delta});
+    }
+    out.setUBCode(UBKind::NoUB);
+    return true;
+}
+
+std::shared_ptr<SwitchStmt>
+SwitchStmt::generateStructure(std::shared_ptr<GenCtx> ctx) {
+    auto gen_pol = ctx->getGenPolicy();
+    auto new_ctx = std::make_shared<GenCtx>(*ctx);
+    // A switch nests like an if-else, so it shares the same depth budget.
+    new_ctx->incIfElseDepth();
+
+    auto ret = std::make_shared<SwitchStmt>();
+    size_t case_num = rand_val_gen->getRandId(gen_pol->switch_case_num_distr);
+    for (size_t i = 0; i < case_num; ++i) {
+        CaseBlock block;
+        block.body = ScopeStmt::generateStructure(new_ctx);
+        ret->cases.push_back(block);
+    }
+    if (rand_val_gen->getRandId(gen_pol->switch_has_default_distr))
+        ret->default_br = ScopeStmt::generateStructure(new_ctx);
+
+    Statistics &stats = Statistics::getInstance();
+    stats.addStmt();
+
+    return ret;
+}
+
+void SwitchStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
+    auto gen_pol = ctx->getGenPolicy();
+
+    auto cond_ctx = std::make_shared<PopulateCtx>(ctx);
+    // As for if-else, a divergent controlling value would give the two value
+    // sets different taken branches, which the value tracking cannot express.
+    cond_ctx->setAllowMulVals(false);
+    cond = ArithmeticExpr::create(cond_ctx);
+    // See IfElseStmt::populate: create() leaves the type unpropagated when it
+    // is allowed to leave UB in dead code, so do it here before inspecting the
+    // condition.
+    cond->propagateType();
+
+    EvalCtx cond_eval_ctx;
+    auto cond_eval_res = cond->evaluate(cond_eval_ctx);
+    if (!cond_eval_res->isScalarVar())
+        ERROR("Switch condition has to be a scalar variable");
+    auto cond_int_type =
+        std::static_pointer_cast<IntegralType>(cond_eval_res->getType());
+
+    // The controlling expression undergoes integral promotion, and every label
+    // is converted to the promoted type. Generating the labels in the
+    // condition's own type keeps them trivially in range of that type, so no
+    // label can be out of range or collide after conversion. bool would leave
+    // only two usable labels, so promote it away.
+    IntTypeID label_type_id = cond_int_type->getIntTypeId();
+    if (label_type_id == IntTypeID::BOOL) {
+        label_type_id = IntTypeID::INT;
+        cond = std::make_shared<TypeCastExpr>(
+            cond, IntegralType::init(IntTypeID::INT), /*is_implicit*/ true);
+        cond->propagateType();
+    }
+
+    IRValue cond_val =
+        std::static_pointer_cast<ScalarVar>(cond_eval_res)->getCurrentValue();
+    if (cond_val.getIntTypeID() != label_type_id)
+        cond_val = cond_val.castToType(label_type_id);
+    // In dead code the value may carry a UB marker (--allow-ub-in-dc). It is
+    // only used here to pick labels, and every body is populated as not taken
+    // anyway, so the marker is irrelevant -- but it must not leak into a label.
+    cond_val.setUBCode(UBKind::NoUB);
+
+    bool matches = rand_val_gen->getRandId(gen_pol->switch_case_matches_distr);
+    // Dense labels are a consecutive run, which compilers lower to a jump
+    // table; sparse ones become a comparison chain or a bit test.
+    bool dense = rand_val_gen->getRandId(gen_pol->switch_dense_labels_distr);
+    // Which case receives the controlling value (only used when matches).
+    // switch_case_num_distr never offers fewer than two cases, but guard the
+    // subtraction rather than rely on that.
+    size_t match_idx = 0;
+    if (cases.empty())
+        matches = false;
+    else
+        match_idx = rand_val_gen->getRandValue(static_cast<size_t>(0),
+                                               cases.size() - 1);
+
+    // Duplicate case labels are ill-formed, so track what we have used and
+    // retry on a collision.
+    std::vector<uint64_t> used_labels;
+    auto is_used = [&used_labels](uint64_t v) {
+        return std::find(used_labels.begin(), used_labels.end(), v) !=
+               used_labels.end();
+    };
+    // Reserve the controlling value either way: as this switch's match, or as a
+    // value no label may take so that `default` is what runs.
+    used_labels.push_back(cond_val.getAbsValue().value);
+
+    size_t filled = 0;
+    for (; filled < cases.size(); ++filled) {
+        if (matches && filled == match_idx) {
+            cases[filled].label = cond_val;
+            continue;
+        }
+        // A narrow condition type has few values, so pick with bounded retries.
+        bool found = false;
+        for (size_t attempt = 0; attempt < 64 && !found; ++attempt) {
+            IRValue candidate;
+            // Fall back to a random label when a dense run would walk off the
+            // end of the type.
+            if (!dense || attempt != 0 ||
+                !denseLabel(label_type_id, cond_val, filled + 1, candidate))
+                candidate = rand_val_gen->getRandValue(label_type_id);
+            if (candidate.hasUB())
+                continue;
+            if (is_used(candidate.getAbsValue().value))
+                continue;
+            candidate.setUBCode(UBKind::NoUB);
+            cases[filled].label = candidate;
+            used_labels.push_back(candidate.getAbsValue().value);
+            found = true;
+        }
+        if (!found)
+            break;
+    }
+    // Drop any case we could not find a distinct label for.
+    if (filled < cases.size()) {
+        cases.resize(filled);
+        // The match was going to live in a case that no longer exists, so no
+        // label matches and `default` runs instead.
+        if (match_idx >= filled)
+            matches = false;
+    }
+    if (cases.empty())
+        matches = false;
+
+    for (auto &c : cases)
+        c.falls_through =
+            rand_val_gen->getRandId(gen_pol->switch_fallthrough_distr);
+    // Falling out of the last case would just run `default`, which the taken
+    // bookkeeping below treats as "no label matched" -- keep the two separate.
+    if (!cases.empty())
+        cases.back().falls_through = false;
+
+    // Work out which bodies run: control enters at the matching label and keeps
+    // going into each following case that its predecessor falls through into.
+    bool any_case_taken = false;
+    bool entered = false;
+    for (size_t i = 0; i < cases.size(); ++i) {
+        if (matches && i == match_idx)
+            entered = true;
+        bool runs = entered;
+        any_case_taken |= runs;
+
+        auto case_ctx = std::make_shared<PopulateCtx>(*ctx);
+        case_ctx->incIfElseDepth();
+        case_ctx->setTaken(ctx->isTaken() && runs);
+        cases[i].body->populate(case_ctx);
+
+        // Control leaves the switch here unless this case falls through.
+        if (entered && !cases[i].falls_through)
+            entered = false;
+    }
+
+    if (default_br.use_count() != 0) {
+        auto default_ctx = std::make_shared<PopulateCtx>(*ctx);
+        default_ctx->incIfElseDepth();
+        // `default` runs exactly when no label matched. It cannot be reached by
+        // fall-through here because it is always emitted last.
+        default_ctx->setTaken(ctx->isTaken() && !any_case_taken);
+        default_br->populate(default_ctx);
+    }
+}
+
+void SwitchStmt::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                      std::string offset) {
+    // As for if-else, the test structure can be dumped before it is populated,
+    // in which case there is no condition and the labels have no type yet.
+    bool populated = cond.use_count() != 0;
+
+    stream << offset << "switch (";
+    if (populated)
+        cond->emit(ctx, stream);
+    stream << ") {\n";
+
+    for (auto &c : cases) {
+        stream << offset << "case ";
+        if (populated) {
+            auto label_expr = std::make_shared<ConstantExpr>(c.label);
+            label_expr->emit(ctx, stream);
+        }
+        stream << ":\n";
+        // The body is a compound statement, which keeps any declaration inside
+        // it out of the reach of the other labels.
+        c.body->emit(ctx, stream, offset + "    ");
+        if (c.falls_through)
+            stream << offset << "    /* fallthrough */\n";
+        else
+            stream << offset << "    break;\n";
+    }
+
+    if (default_br.use_count() != 0) {
+        stream << offset << "default:\n";
+        default_br->emit(ctx, stream, offset + "    ");
+        stream << offset << "    break;\n";
+    }
+
+    stream << offset << "}\n";
 }
 
 void StubStmt::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,

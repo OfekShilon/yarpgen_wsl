@@ -202,6 +202,48 @@ class GenPolicy {
     std::vector<Probability<bool>> vectorizable_loop_distr;
     void makeVectorizable();
 
+    // Which cv-qualifier to put on generated global data. Inputs may be const
+    // (they are never written by the test), outputs may not. Arrays are never
+    // const because the driver's init() writes them.
+    std::vector<Probability<CVQualifier>> inp_var_cv_qual_distr;
+    std::vector<Probability<CVQualifier>> out_var_cv_qual_distr;
+    std::vector<Probability<CVQualifier>> arr_cv_qual_distr;
+
+    // Syntactic form of a counted loop.
+    std::vector<Probability<LoopForm>> loop_form_distr;
+
+    // Break/continue injected at the top of a loop body.
+    std::vector<Probability<LoopJumpKind>> loop_jump_distr;
+    // Fraction of the trip count that a BREAK keeps. The remaining entry (100)
+    // means the exit is never taken.
+    std::vector<Probability<size_t>> break_keep_percent_distr;
+    // Number of leading iterations skipped by a CONT_PREFIX continue.
+    std::vector<Probability<size_t>> cont_skip_num_distr;
+    // Whether to hide the jump's threshold behind the `zero` variable so the
+    // compiler cannot fold the exit away.
+    std::vector<Probability<bool>> hide_jump_bound_distr;
+
+    // switch statements
+    std::vector<Probability<size_t>> switch_case_num_distr;
+    // Whether the controlling value actually matches one of the case labels
+    // (otherwise `default` runs).
+    std::vector<Probability<bool>> switch_case_matches_distr;
+    // Whether a case omits its break and falls through to the next one.
+    std::vector<Probability<bool>> switch_fallthrough_distr;
+    // Whether a default label is present at all.
+    std::vector<Probability<bool>> switch_has_default_distr;
+    // Dense case labels (consecutive values, lowered as a jump table) versus
+    // sparse ones (lowered as a comparison chain or bit test).
+    std::vector<Probability<bool>> switch_dense_labels_distr;
+
+    // Spell a step-by-one reduction as ++/-- rather than += 1.
+    std::vector<Probability<bool>> use_inc_dec_distr;
+    std::vector<Probability<IncDecKind>> inc_dec_kind_distr;
+
+    // Fold a plain assignment into a compound assignment.
+    std::vector<Probability<bool>> use_compound_assign_distr;
+    std::vector<Probability<BinaryOp>> compound_assign_op_distr;
+
   private:
     template <typename T>
     void uniformProbFromMax(std::vector<Probability<T>> &distr, size_t max_num,

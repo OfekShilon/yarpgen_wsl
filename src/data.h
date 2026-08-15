@@ -38,12 +38,29 @@ class Data {
   public:
     Data(std::string _name, std::shared_ptr<Type> _type)
         : name(std::move(_name)), type(std::move(_type)),
-          ub_code(UBKind::Uninit), is_dead(true), alignment(0) {}
+          ub_code(UBKind::Uninit), is_dead(true), alignment(0),
+          decl_cv_qualifier(CVQualifier::NONE) {}
     virtual ~Data() = default;
 
     virtual std::string getName(std::shared_ptr<EmitCtx> ctx) { return name; }
     void setName(std::string _name) { name = std::move(_name); }
     std::shared_ptr<Type> getType() { return type; }
+
+    // The cv-qualifier to spell on this object's *declaration*.
+    //
+    // This deliberately does not live in Type. Types are interned and their
+    // identity (IntegralType::isSame, ArrayType::isSame) includes the
+    // qualifier, and expressions are re-evaluated after generation finishes --
+    // emitting a loop header re-evaluates its bound expressions, for instance.
+    // Swapping a Data's type for a qualified one therefore makes
+    // TypedData::replaceWith see a type mismatch and abort. A qualifier affects
+    // neither values nor the usual arithmetic conversions, so keeping it beside
+    // the type, and consulting it only where a declaration is emitted, is both
+    // correct and free of that coupling.
+    CVQualifier getDeclCVQualifier() { return decl_cv_qualifier; }
+    void setDeclCVQualifier(CVQualifier _cv_qual) {
+        decl_cv_qualifier = _cv_qual;
+    }
 
     UBKind getUBCode() { return ub_code; }
     void setUBCode(UBKind _ub) { ub_code = _ub; }
@@ -84,6 +101,7 @@ class Data {
     // They create a lot of dead code in the test, so we need to prune them.
     bool is_dead;
     size_t alignment;
+    CVQualifier decl_cv_qualifier;
 };
 
 // Shorthand to make it simpler
@@ -220,6 +238,10 @@ class Iterator : public Data {
                        std::shared_ptr<Expr> _step);
     bool isDegenerate() { return degenerate; }
     size_t getTotalItersNum() { return total_iters_num; }
+    // Lowered when a break/continue guard shortens the loop. Everything that
+    // depends on how many iterations run -- reduction values above all -- reads
+    // this, so it has to be set before the loop body is populated.
+    void setTotalItersNum(size_t _num) { total_iters_num = _num; }
 
     void setSupportsMulValues(bool _supports_mul_values) {
         supports_mul_values = _supports_mul_values;

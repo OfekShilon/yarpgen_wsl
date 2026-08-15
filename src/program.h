@@ -28,6 +28,7 @@ class ProgramGenerator {
     void emit();
 
   private:
+    void applyCVQualifiers(const std::shared_ptr<GenPolicy> &gen_pol);
     void emitCheckFunc(std::ostream &stream);
     void emitDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream);
     void emitInit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream);

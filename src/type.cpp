@@ -138,6 +138,20 @@ std::shared_ptr<Type> IntegralType::makeVarying() {
     return init(getIntTypeId(), getIsStatic(), getCVQualifier(), false);
 }
 
+std::string yarpgen::cvQualifierPrefix(CVQualifier cv_qual) {
+    switch (cv_qual) {
+        case CVQualifier::NONE:
+            return "";
+        case CVQualifier::CONST:
+            return "const ";
+        case CVQualifier::VOLAT:
+            return "volatile ";
+        case CVQualifier::CONST_VOLAT:
+            return "const volatile ";
+    }
+    ERROR("Bad CVQualifier");
+}
+
 std::string IntegralType::getNameImpl(std::shared_ptr<EmitCtx> ctx,
                                       std::string raw_name) {
     if (!ctx)
@@ -154,7 +168,9 @@ std::string IntegralType::getNameImpl(std::shared_ptr<EmitCtx> ctx,
         else
             ret += "bool";
     }
-    return ret;
+    // The qualifier goes in front of everything else, including the ISPC
+    // uniform/varying keyword.
+    return cvQualifierPrefix(getCVQualifier()) + ret;
 }
 
 std::string IntegralType::getLiteralSuffix() {
@@ -250,7 +266,9 @@ ArrayType::init(std::shared_ptr<Type> _base_type, std::vector<size_t> _dims,
 
 std::string ArrayType::getName(std::shared_ptr<EmitCtx> ctx) {
     // TODO: we need a more correct way to do it
-    return base_type->getName(ctx) + " *";
+    // The element qualifier already comes from the base type; this one applies
+    // to the array itself.
+    return cvQualifierPrefix(getCVQualifier()) + base_type->getName(ctx) + " *";
 }
 
 std::shared_ptr<ArrayType> ArrayType::create(std::shared_ptr<PopulateCtx> ctx) {

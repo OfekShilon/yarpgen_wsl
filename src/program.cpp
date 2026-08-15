@@ -52,6 +52,13 @@ ProgramGenerator::ProgramGenerator() : hash_seed(0) {
 
     new_test->populate(pop_ctx);
 
+    // Qualifiers are applied only once the program is fully populated. They do
+    // not participate in value computation or in the usual arithmetic
+    // conversions, so adding them here cannot invalidate the casts that
+    // propagateType() already inserted -- whereas qualifying the types up front
+    // would make every type comparison in propagateType() see a mismatch.
+    applyCVQualifiers(gen_pol);
+
     // Create a special variable that we use to hide the information from
     // compiler
     auto zero_var = std::make_shared<ScalarVar>(
@@ -59,6 +66,39 @@ ProgramGenerator::ProgramGenerator() : hash_seed(0) {
         IRValue(IntTypeID::INT, IRValue::AbsValue{false, 0}));
     zero_var->setIsDead(false);
     ext_inp_sym_tbl->addVar(zero_var);
+}
+
+// Attach cv-qualifiers to the generated global data.
+//
+// What may be qualified is dictated by who writes the object:
+//  - input scalars are only read by test(), so they may be const or volatile;
+//  - output scalars are written by test(), so const is out;
+//  - arrays are written by the driver's init(), so const is out for them too.
+// `zero` is deliberately left unqualified: it exists to hide a value from the
+// optimizer, and const would let the compiler fold it away.
+void ProgramGenerator::applyCVQualifiers(
+    const std::shared_ptr<GenPolicy> &gen_pol) {
+    Options &options = Options::getInstance();
+    if (!options.extendedFeaturesSupported() ||
+        options.getCVQualifiers() == OptionLevel::NONE)
+        return;
+    bool qualify_all = options.getCVQualifiers() == OptionLevel::ALL;
+
+    auto qualify = [&qualify_all](const std::shared_ptr<Data> &data,
+                                  std::vector<Probability<CVQualifier>> &distr,
+                                  CVQualifier all_qual) {
+        data->setDeclCVQualifier(qualify_all ? all_qual
+                                             : rand_val_gen->getRandId(distr));
+    };
+
+    for (auto &var : ext_inp_sym_tbl->getVars())
+        qualify(var, gen_pol->inp_var_cv_qual_distr, CVQualifier::CONST);
+    for (auto &var : ext_out_sym_tbl->getVars())
+        qualify(var, gen_pol->out_var_cv_qual_distr, CVQualifier::VOLAT);
+    for (auto &array : ext_inp_sym_tbl->getArrays())
+        qualify(array, gen_pol->arr_cv_qual_distr, CVQualifier::VOLAT);
+    for (auto &array : ext_out_sym_tbl->getArrays())
+        qualify(array, gen_pol->arr_cv_qual_distr, CVQualifier::VOLAT);
 }
 
 void ProgramGenerator::emitCheckFunc(std::ostream &stream) {
@@ -89,6 +129,13 @@ static void emitVarsDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
     for (auto &var : vars) {
         if (!options.getAllowDeadData() && var->getIsDead())
             continue;
+        // In C++ a namespace-scope `const` object has internal linkage, so the
+        // `extern const T x;` in init.h would not resolve against a plain
+        // `const T x = ...;` here. An explicit `extern` on the definition gives
+        // it external linkage again. C needs no such fixup.
+        if (options.isCXX() &&
+            var->getDeclCVQualifier() == CVQualifier::CONST)
+            stream << "extern ";
         auto init_val = std::make_shared<ConstantExpr>(var->getInitValue());
         auto decl_stmt = std::make_shared<DeclStmt>(var, init_val);
         decl_stmt->emit(ctx, stream);
@@ -119,6 +166,7 @@ static void emitArrayDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         auto array_type = std::static_pointer_cast<ArrayType>(type);
         if (array->getAlignment() != 0)
             stream << alignAttr(array->getAlignment()) << " ";
+        stream << cvQualifierPrefix(array->getDeclCVQualifier());
         stream << array_type->getBaseType()->getName(ctx) << " ";
         stream << array->getName(ctx) << " ";
         for (const auto &dimension : array_type->getDimensions()) {
@@ -302,6 +350,7 @@ static void emitVarExtDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
             continue;
         }
         stream << "extern ";
+        stream << cvQualifierPrefix(var->getDeclCVQualifier());
         stream << var->getType()->getName(ctx);
         stream << " ";
         stream << var->getName(ctx) << ";\n";
@@ -329,6 +378,14 @@ static void emitArrayExtDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         if (pass_as_param) {
             pass_as_param_buffer.push_back(array->getName(ctx));
             any_arrays_as_params = true;
+            // An array parameter cannot carry the qualifier. Unlike a scalar,
+            // which is passed by value and so simply drops it, an array decays
+            // to a pointer that keeps it -- so `volatile T p[N]` would trip
+            // C++20's deprecation of volatile-qualified parameter types and
+            // force the caller's argument to match. Clearing it on the Data
+            // keeps the parameter, the driver's definition and the call
+            // consistent, because this runs before either is emitted.
+            array->setDeclCVQualifier(CVQualifier::NONE);
             continue;
         }
 
@@ -373,6 +430,7 @@ static void emitArrayExtDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         if (alignment != 0)
             stream << alignAttr(alignment) << " ";
         stream << "extern ";
+        stream << cvQualifierPrefix(array->getDeclCVQualifier());
         stream << array_type->getBaseType()->getName(ctx);
         stream << " ";
         stream << array->getName(ctx) << " ";
@@ -412,8 +470,21 @@ static bool emitVarFuncParam(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
             continue;
 
         stream << placeSep(emit_any);
-        if (emit_type)
-            stream << var->getType()->getName(ctx) << " ";
+        if (emit_type) {
+            // A top-level cv-qualifier on a parameter is not part of the
+            // function type, so dropping it here keeps this declaration and the
+            // one in the driver compatible. `volatile` has to be dropped:
+            // C++20 deprecates volatile-qualified parameters. `const` stays:
+            // it is well-formed and says the copy never changes.
+            CVQualifier cv_qual = var->getDeclCVQualifier();
+            if (cv_qual == CVQualifier::VOLAT ||
+                cv_qual == CVQualifier::CONST_VOLAT)
+                cv_qual = cv_qual == CVQualifier::CONST_VOLAT
+                              ? CVQualifier::CONST
+                              : CVQualifier::NONE;
+            stream << cvQualifierPrefix(cv_qual)
+                   << var->getType()->getName(ctx) << " ";
+        }
         stream << var->getName(ctx);
         emit_any = true;
     }
@@ -439,7 +510,8 @@ static void emitArrayFuncParam(std::shared_ptr<EmitCtx> ctx,
         auto array_type = std::static_pointer_cast<ArrayType>(type);
         stream << placeSep(prev_category_exist || !first);
         if (emit_type)
-            stream << array_type->getBaseType()->getName(ctx) << " ";
+            stream << cvQualifierPrefix(array->getDeclCVQualifier())
+                   << array_type->getBaseType()->getName(ctx) << " ";
         stream << array->getName(ctx) << " ";
         if (emit_dims)
             for (const auto &dimension : array_type->getDimensions())

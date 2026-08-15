@@ -100,6 +100,12 @@ class OptionParser {
     static void parseMutationSeed(std::string mutation_seed_str);
     static void parseAllowUBInDC(std::string allow_ub_in_dc_str);
     static void parseMaxArrayDims(std::string max_array_dims_str);
+    static void parseCVQualifiers(std::string val);
+    static void parseLoopForms(std::string val);
+    static void parseLoopJumps(std::string val);
+    static void parseEmitSwitch(std::string val);
+    static void parseIncDec(std::string val);
+    static void parseCompoundAssign(std::string val);
 };
 
 class Options {
@@ -177,6 +183,36 @@ class Options {
     void setMaxArrayDims(size_t _val) { max_array_dims = _val; }
     size_t getMaxArrayDims() { return max_array_dims; }
 
+    // Emit const/volatile on the generated global data. NONE disables it, SOME
+    // qualifies a random subset, ALL qualifies everything that can legally be
+    // qualified.
+    void setCVQualifiers(OptionLevel _val) { cv_qualifiers = _val; }
+    OptionLevel getCVQualifiers() { return cv_qualifiers; }
+
+    // Emit counted loops as `while` / `do-while` instead of `for`.
+    void setLoopForms(OptionLevel _val) { loop_forms = _val; }
+    OptionLevel getLoopForms() { return loop_forms; }
+
+    // Inject `break` / `continue` into loop bodies.
+    void setLoopJumps(OptionLevel _val) { loop_jumps = _val; }
+    OptionLevel getLoopJumps() { return loop_jumps; }
+
+    // Generate `switch` statements.
+    void setEmitSwitch(OptionLevel _val) { emit_switch = _val; }
+    OptionLevel getEmitSwitch() { return emit_switch; }
+
+    // Spell "step by one" reductions as ++ / --.
+    void setIncDec(OptionLevel _val) { inc_dec = _val; }
+    OptionLevel getIncDec() { return inc_dec; }
+
+    // Fold plain assignments into compound assignments (`x op= expr`).
+    void setCompoundAssign(OptionLevel _val) { compound_assign = _val; }
+    OptionLevel getCompoundAssign() { return compound_assign; }
+
+    // The new language-surface features are only implemented (and only
+    // validated) for C and C++. ISPC and SYCL keep the previous behaviour.
+    bool extendedFeaturesSupported() { return isC() || isCXX(); }
+
     void dump(std::ostream &stream);
 
   private:
@@ -188,7 +224,10 @@ class Options {
           emit_pragmas(OptionLevel::SOME), out_dir("."),
           use_param_shuffle(false), expl_loop_params(false),
           mutation_kind(MutationKind::NONE), mutation_seed(0),
-          allow_ub_in_dc(OptionLevel::NONE), max_array_dims(0) {}
+          allow_ub_in_dc(OptionLevel::NONE), max_array_dims(0),
+          cv_qualifiers(OptionLevel::SOME), loop_forms(OptionLevel::SOME),
+          loop_jumps(OptionLevel::SOME), emit_switch(OptionLevel::SOME),
+          inc_dec(OptionLevel::SOME), compound_assign(OptionLevel::SOME) {}
 
     std::vector<std::string> raw_options;
 
@@ -222,5 +261,13 @@ class Options {
 
     // Upper bound on array dimensions (0 = no explicit limit).
     size_t max_array_dims;
+
+    // Knobs for the extended language surface (C / C++ only).
+    OptionLevel cv_qualifiers;
+    OptionLevel loop_forms;
+    OptionLevel loop_jumps;
+    OptionLevel emit_switch;
+    OptionLevel inc_dec;
+    OptionLevel compound_assign;
 };
 } // namespace yarpgen

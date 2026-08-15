@@ -49,6 +49,48 @@ The script will run several compilers with several compiler options and run exec
 
 Also you may want to test compilers for future hardware, which is not available to you at the moment. The standard way to do that is to download the [Intel® Software Development Emulator](http://www.intel.com/software/sde). ``run_gen.py`` assumes that it is available in your ``$PATH``.
 
+Extended C/C++ language surface
+-------------------------------
+
+Beyond the core loop/expression generator, a few extra constructs can be mixed
+into generated C and C++ tests. Each is controlled by an option taking
+``none`` / ``some`` / ``all``, and each defaults to ``some``:
+
+| Option | What it adds |
+|---|---|
+| ``--cv-qualifiers`` | ``const`` on input variables, ``volatile`` on variables and arrays |
+| ``--loop-forms`` | counted loops spelled as ``while`` and ``do-while``, not just ``for`` |
+| ``--loop-jumps`` | ``break`` and ``continue`` guards inside loop bodies |
+| ``--emit-switch`` | ``switch`` statements, with dense or sparse labels and fall-through |
+| ``--inc-dec`` | step-by-one reductions spelled ``++`` / ``--`` (prefix and postfix) |
+| ``--compound-assign`` | plain assignments folded into ``x op= e``. Restricted to statements outside any loop, where the assignment provably runs once — which is what makes ``<<=``, ``>>=``, ``/=`` and ``%=`` reachable at all, since repeating them is not safe |
+
+These target constructs the core generator did not reach: multi-exit loops and
+non-``for`` latches (loop rotation, early-exit vectorization), jump tables and
+comparison chains (``switch`` lowering), and the optimization barriers that
+``volatile`` imposes.
+
+All of them are C/C++ only — ISPC and SYCL output is unaffected. Setting every
+one to ``none`` reproduces the previous generator bit-for-bit, so old seeds
+still reproduce their original programs:
+
+```sh
+yarpgen --cv-qualifiers=none --loop-forms=none --loop-jumps=none \
+        --emit-switch=none --inc-dec=none --compound-assign=none
+```
+
+Note that enabling any of them shifts the random stream (parameter shuffling
+draws from it while building the policy), so a given seed produces a different
+program than it did before. That is expected; the flags above are the way back
+to the old mapping.
+
+``--loop-jumps`` interacts with ``--check-algo``. ``break`` and the trip-count
+shortening form of ``continue`` change how many iterations a loop runs, which the
+``asserts`` and ``precompute`` algorithms cannot model for a partially written
+array, so under those algorithms only the never-taken ``continue`` form is
+generated. The default ``hash`` algorithm compares hashes between compilers and
+is unaffected.
+
 ISPC testing
 ------------
 

@@ -37,6 +37,9 @@ class PopulateCtx;
 class EmitCtx;
 class Iterator;
 
+// Spelling of a cv-qualifier, as a declaration prefix ("" for NONE).
+std::string cvQualifierPrefix(CVQualifier cv_qual);
+
 // Abstract class that serves as a common ancestor for all types.
 // Here by "type" we mean a backend type, which has certain properties
 // and may be instantiated as different language types
@@ -71,6 +74,10 @@ class Type {
 
   private:
     bool is_static;
+    // Part of the type's identity in the folding set, and now spelled by
+    // getName(). Note that the qualifiers the generator actually puts on
+    // generated data live on Data instead, precisely because they must *not*
+    // participate in type identity -- see Data::getDeclCVQualifier().
     CVQualifier cv_qualifier;
 
     // ISPC

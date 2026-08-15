@@ -2513,8 +2513,124 @@ Expr::EvalResType AssignmentExpr::rebuild(EvalCtx &ctx) {
     return evaluate(ctx);
 }
 
+void AssignmentExpr::makeCompound(BinaryOp op) {
+    // The right-hand occurrence of `to` has to keep reading the value the
+    // variable holds *before* this statement, and a plain to->copy() would not:
+    // it shares the ScalarVar with `to`, so propagateValue() overwrites it.
+    // That matters because ExprStmt::create() rebuilds the expression once more
+    // after propagateValue() (its cached eval result is stale, so the UB check
+    // there still fires), and that rebuild would then eliminate UB against the
+    // post-assignment value -- leaving real UB for the pre-assignment value the
+    // generated program actually reads.
+    //
+    // Giving the occurrence a private copy of the Data pins it to the
+    // pre-assignment value. The copy keeps the name, so emission is unchanged,
+    // and the value is right because `to` is a variable created for this
+    // statement: nothing has written it yet, and only inputs are ever read by
+    // other statements.
+    auto to_var = std::static_pointer_cast<ScalarVar>(to->getValue());
+    auto pinned_var = std::make_shared<ScalarVar>(*to_var);
+    compound_to_copy = std::make_shared<ScalarVarUseExpr>(pinned_var);
+    compound_binary = std::make_shared<BinaryExpr>(op, compound_to_copy, from);
+    from = compound_binary;
+}
+
+// Strip the implicit casts that propagateType() layers on top of a subtree.
+static std::shared_ptr<Expr> stripImplicitCasts(std::shared_ptr<Expr> expr) {
+    while (expr != nullptr && expr->getKind() == IRNodeKind::TYPE_CAST) {
+        auto cast = std::static_pointer_cast<TypeCastExpr>(expr);
+        if (!cast->isImplicit())
+            break;
+        expr = cast->getExpr();
+    }
+    return expr;
+}
+
+// Only these ten operators have a compound form; &&, || and the comparisons do
+// not. rebuild() can only ever move between ADD/SUB/MUL/DIV, so an operator
+// that starts in this set stays in it.
+static bool hasCompoundForm(BinaryOp op) {
+    switch (op) {
+        case BinaryOp::ADD:
+        case BinaryOp::SUB:
+        case BinaryOp::MUL:
+        case BinaryOp::DIV:
+        case BinaryOp::MOD:
+        case BinaryOp::BIT_AND:
+        case BinaryOp::BIT_OR:
+        case BinaryOp::BIT_XOR:
+        case BinaryOp::SHL:
+        case BinaryOp::SHR:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool AssignmentExpr::compoundFormIsValid() {
+    if (compound_binary == nullptr)
+        return false;
+    // The multiple-values path emits a ternary over two different right-hand
+    // sides, which has no compound spelling.
+    if (versioning_iter != nullptr || second_from != nullptr)
+        return false;
+    // C++20 deprecates compound assignment to a volatile-qualified object.
+    if (to->yieldsVolatileLvalue())
+        return false;
+    if (!hasCompoundForm(compound_binary->getOp()))
+        return false;
+    // `from` must still be our BinaryExpr (possibly cast to `to`'s type)...
+    if (stripImplicitCasts(from) != compound_binary)
+        return false;
+    // ...and its left operand must still be the copy of `to`. rebuild() wraps
+    // the left operand when it fixes a shift of a negative value, which breaks
+    // the equivalence with `to op= rhs`.
+    return stripImplicitCasts(compound_binary->getLhs()) == compound_to_copy;
+}
+
+// The compound operator's spelling, e.g. "+" for `+=`.
+static std::string compoundOpSpelling(BinaryOp op) {
+    switch (op) {
+        case BinaryOp::ADD:
+            return "+";
+        case BinaryOp::SUB:
+            return "-";
+        case BinaryOp::MUL:
+            return "*";
+        case BinaryOp::DIV:
+            return "/";
+        case BinaryOp::MOD:
+            return "%";
+        case BinaryOp::BIT_AND:
+            return "&";
+        case BinaryOp::BIT_OR:
+            return "|";
+        case BinaryOp::BIT_XOR:
+            return "^";
+        case BinaryOp::SHL:
+            return "<<";
+        case BinaryOp::SHR:
+            return ">>";
+        default:
+            ERROR("Operator has no compound form");
+    }
+}
+
 void AssignmentExpr::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
                           std::string offset) {
+    // `to op= rhs` is by definition `to = (T)(to <conv> op rhs <conv>)` with
+    // the same usual arithmetic conversions the spelled-out form gets, so the
+    // two are interchangeable and the promotion casts inside the BinaryExpr
+    // can be dropped from the output.
+    if (compoundFormIsValid()) {
+        stream << offset;
+        to->emit(ctx, stream);
+        stream << " " << compoundOpSpelling(compound_binary->getOp()) << "= (";
+        compound_binary->getRhs()->emit(ctx, stream);
+        stream << ")";
+        return;
+    }
+
     stream << offset;
     to->emit(ctx, stream);
     stream << " = ";
@@ -2557,7 +2673,7 @@ void AssignmentExpr::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
 }
 
 std::shared_ptr<AssignmentExpr>
-AssignmentExpr::create(std::shared_ptr<PopulateCtx> ctx) {
+AssignmentExpr::create(std::shared_ptr<PopulateCtx> ctx, bool allow_compound) {
     auto gen_pol = ctx->getGenPolicy();
 
     auto from = ArithmeticExpr::create(ctx);
@@ -2612,7 +2728,34 @@ AssignmentExpr::create(std::shared_ptr<PopulateCtx> ctx) {
         to->getValue()->getType()->isUniform())
         from = std::make_shared<ExtractCall>(from);
 
-    return std::make_shared<AssignmentExpr>(to, from, ctx->isTaken());
+    auto ret = std::make_shared<AssignmentExpr>(to, from, ctx->isTaken());
+
+    // `x op= e` reads x, so it is a loop-carried update whenever the statement
+    // runs more than once, and N applications can overflow where one does not.
+    // Modelling that is exactly what ReductionExpr exists for, and it is where
+    // in-loop compound assignments come from. Here we therefore only fold at
+    // loop depth zero, where the statement provably executes once and the
+    // single-step value that evaluate() computes is the final one.
+    //
+    // The upside of restricting it this way is that shifts, division and modulo
+    // become reachable at all: reductions exclude them precisely because they
+    // are unsafe to repeat.
+    if (allow_compound && options.extendedFeaturesSupported() &&
+        options.getCompoundAssign() != OptionLevel::NONE &&
+        ctx->getLoopDepth() == 0 &&
+        to->getKind() == IRNodeKind::SCALAR_VAR_USE) {
+        auto to_int_type =
+            std::static_pointer_cast<IntegralType>(to->getValue()->getType());
+        // `bool op= e` is legal but pointless and warns on some compilers.
+        bool eligible = to_int_type->getIntTypeId() != IntTypeID::BOOL;
+        if (eligible &&
+            (options.getCompoundAssign() == OptionLevel::ALL ||
+             rand_val_gen->getRandId(gen_pol->use_compound_assign_distr)))
+            ret->makeCompound(
+                rand_val_gen->getRandId(gen_pol->compound_assign_op_distr));
+    }
+
+    return ret;
 }
 
 std::shared_ptr<Expr> AssignmentExpr::copy() {
@@ -2621,6 +2764,9 @@ std::shared_ptr<Expr> AssignmentExpr::copy() {
     auto ret = std::make_shared<AssignmentExpr>(new_to, new_from, taken);
     ret->second_from = second_from;
     ret->versioning_iter = versioning_iter;
+    // The copy has a freshly built `from`, so the pointers that identify the
+    // compound shape no longer refer into it. Leaving them null makes the copy
+    // fall back to the plain spelling, which is always correct.
     return ret;
 }
 
@@ -2631,6 +2777,8 @@ AssignmentExpr::AssignmentExpr(std::shared_ptr<Expr> _to,
     taken = _taken;
     to = std::move(_to);
     versioning_iter = nullptr;
+    compound_binary = nullptr;
+    compound_to_copy = nullptr;
 }
 
 bool ReductionExpr::propagateType() { return AssignmentExpr::propagateType(); }
@@ -2809,6 +2957,42 @@ void ReductionExpr::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         return;
     }
 
+    // C++20 deprecates both compound assignment to, and ++/-- of, a
+    // volatile-qualified object. Such reductions get spelled out instead.
+    // Qualifiers are assigned after the program is populated, so this can only
+    // be decided here at emit time.
+    bool avoid_volatile =
+        Options::getInstance().isCXX() && to->yieldsVolatileLvalue();
+
+    // A reduction that steps by exactly one can be spelled ++/--.
+    if (inc_dec_kind != IncDecKind::MAX_INC_DEC_KIND && !avoid_volatile) {
+        stream << offset;
+        bool is_inc = inc_dec_kind == IncDecKind::PRE_INC ||
+                      inc_dec_kind == IncDecKind::POST_INC;
+        bool is_prefix = inc_dec_kind == IncDecKind::PRE_INC ||
+                         inc_dec_kind == IncDecKind::PRE_DEC;
+        std::string spelling = is_inc ? "++" : "--";
+        if (is_prefix)
+            stream << spelling;
+        to->emit(ctx, stream);
+        if (!is_prefix)
+            stream << spelling;
+        return;
+    }
+
+    // `to = to op from` performs the same single read and single write as
+    // `to op= from`, so the two forms are equivalent.
+    if (bin_op != BinaryOp::MAX_BIN_OP && avoid_volatile) {
+        stream << offset;
+        to->emit(ctx, stream);
+        stream << " = ((";
+        to->emit(ctx, stream);
+        stream << ") " << compoundOpSpelling(bin_op) << " (";
+        from->emit(ctx, stream);
+        stream << "))";
+        return;
+    }
+
     stream << offset;
     to->emit(ctx, stream);
 
@@ -2865,6 +3049,29 @@ ReductionExpr::create(std::shared_ptr<PopulateCtx> ctx) {
         lib_call =
             rand_val_gen->getRandId(gen_pol->reduction_as_lib_call_distr);
 
+    // Decide on ++/-- before anything downstream looks at bin_op: forcing
+    // ADD/SUB here also (correctly) steers the target away from arrays, since
+    // only & and | are safe to repeat over array elements.
+    //
+    // Routing ++/-- through ReductionExpr rather than a plain assignment is
+    // what makes it sound inside a loop: reductionHelper applies the step
+    // total_iters_num times over IRValue arithmetic, so an increment that
+    // would overflow after N iterations is detected and the expression
+    // degrades to a plain assignment instead.
+    Options &options = Options::getInstance();
+    IncDecKind inc_dec_kind = IncDecKind::MAX_INC_DEC_KIND;
+    if (options.extendedFeaturesSupported() &&
+        options.getIncDec() != OptionLevel::NONE &&
+        (options.getIncDec() == OptionLevel::ALL ||
+         rand_val_gen->getRandId(gen_pol->use_inc_dec_distr))) {
+        inc_dec_kind = rand_val_gen->getRandId(gen_pol->inc_dec_kind_distr);
+        bin_op = (inc_dec_kind == IncDecKind::PRE_INC ||
+                  inc_dec_kind == IncDecKind::POST_INC)
+                     ? BinaryOp::ADD
+                     : BinaryOp::SUB;
+        lib_call = LibCallKind::MAX_LIB_CALL_KIND;
+    }
+
     auto new_gen_pol = std::make_shared<GenPolicy>(*gen_pol);
     // For "|" and "&" we allow to use arrays as a reduction variable
     if (bin_op != BinaryOp::BIT_AND && bin_op != BinaryOp::BIT_OR) {
@@ -2876,7 +3083,8 @@ ReductionExpr::create(std::shared_ptr<PopulateCtx> ctx) {
                 other_option_exists = true;
         }
         if (!other_option_exists) {
-            auto base_assign_expr = AssignmentExpr::create(ctx);
+            auto base_assign_expr =
+                AssignmentExpr::create(ctx, /*allow_compound*/ false);
             return std::make_shared<ReductionExpr>(
                 base_assign_expr, BinaryOp::MAX_BIN_OP,
                 LibCallKind::MAX_LIB_CALL_KIND, true, ctx->isTaken());
@@ -2886,12 +3094,12 @@ ReductionExpr::create(std::shared_ptr<PopulateCtx> ctx) {
     auto active_ctx = std::make_shared<PopulateCtx>(*ctx);
     active_ctx->setGenPolicy(new_gen_pol);
 
-    auto base_assign_expr = AssignmentExpr::create(active_ctx);
+    auto base_assign_expr =
+        AssignmentExpr::create(active_ctx, /*allow_compound*/ false);
 
     // ISPC has some problems with bool type in compound assignments, so we
     // will disable them for now
     // TODO: fix me later!
-    Options &options = Options::getInstance();
     if (options.isISPC()) {
         base_assign_expr->propagateType();
         assert(base_assign_expr->getValue()->getType()->isIntType() &&
@@ -2920,8 +3128,25 @@ ReductionExpr::create(std::shared_ptr<PopulateCtx> ctx) {
         }
     }
 
-    return std::make_shared<ReductionExpr>(base_assign_expr, bin_op, lib_call,
-                                           false, ctx->isTaken());
+    auto ret = std::make_shared<ReductionExpr>(base_assign_expr, bin_op,
+                                               lib_call, false, ctx->isTaken());
+
+    if (inc_dec_kind != IncDecKind::MAX_INC_DEC_KIND) {
+        base_assign_expr->propagateType();
+        auto to_int_type = std::static_pointer_cast<IntegralType>(
+            base_assign_expr->getTo()->getValue()->getType());
+        // `b++` on a bool is ill-formed since C++17. The ISPC workaround above
+        // may also have moved bin_op off ADD/SUB.
+        if (to_int_type->getIntTypeId() != IntTypeID::BOOL &&
+            (bin_op == BinaryOp::ADD || bin_op == BinaryOp::SUB)) {
+            IRValue one(to_int_type->getIntTypeId(),
+                        IRValue::AbsValue{false, 1});
+            ret->setFrom(std::make_shared<ConstantExpr>(one));
+            ret->setIncDecKind(inc_dec_kind);
+        }
+    }
+
+    return ret;
 }
 
 std::shared_ptr<Expr> ReductionExpr::copy() {
@@ -2931,6 +3156,7 @@ std::shared_ptr<Expr> ReductionExpr::copy() {
         std::static_pointer_cast<AssignmentExpr>(new_assign), bin_op,
         lib_call_kind, is_degenerate, taken);
     new_reduction->result_expr = new_result_expr;
+    new_reduction->inc_dec_kind = inc_dec_kind;
     return new_reduction;
 }
 
@@ -3132,11 +3358,23 @@ void MinMaxCallBase::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         stream << "min";
     else
         ERROR("Unsupported LibCallKind");
-    stream << "((";
+    // A volatile-qualified lvalue cannot be passed to std::min/std::max: they
+    // take `const T&`, so deduction yields `volatile int` for that argument and
+    // `int` for the other one and fails. Casting turns both into prvalues of
+    // the call's own type, which is a no-op for every non-volatile test.
+    bool needs_cast = options.isCXX() && (a->yieldsVolatileLvalue() ||
+                                          b->yieldsVolatileLvalue());
+    std::string cast_prefix, cast_suffix;
+    if (needs_cast) {
+        cast_prefix = "(" + getValue()->getType()->getName(ctx) + ") (";
+        cast_suffix = ")";
+    }
+
+    stream << "((" << cast_prefix;
     a->emit(ctx, stream);
-    stream << "), (";
+    stream << cast_suffix << "), (" << cast_prefix;
     b->emit(ctx, stream);
-    stream << "))";
+    stream << cast_suffix << "))";
 }
 
 std::shared_ptr<LibCallExpr>

@@ -214,6 +214,60 @@ std::vector<OptionDescr> yarpgen::OptionParser::options_set{
      OptionParser::parseMaxArrayDims,
      "0",
      {}},
+    {OptionKind::CV_QUALIFIERS,
+     "",
+     "--cv-qualifiers",
+     true,
+     "Emit const/volatile on generated global data (C/C++ only)",
+     "Can't parse cv-qualifiers use level",
+     OptionParser::parseCVQualifiers,
+     "some",
+     {"none", "some", "all"}},
+    {OptionKind::LOOP_FORMS,
+     "",
+     "--loop-forms",
+     true,
+     "Emit counted loops as while/do-while as well as for (C/C++ only)",
+     "Can't parse loop-forms use level",
+     OptionParser::parseLoopForms,
+     "some",
+     {"none", "some", "all"}},
+    {OptionKind::LOOP_JUMPS,
+     "",
+     "--loop-jumps",
+     true,
+     "Inject break/continue into loop bodies (C/C++ only)",
+     "Can't parse loop-jumps use level",
+     OptionParser::parseLoopJumps,
+     "some",
+     {"none", "some", "all"}},
+    {OptionKind::EMIT_SWITCH,
+     "",
+     "--emit-switch",
+     true,
+     "Generate switch statements (C/C++ only)",
+     "Can't parse emit-switch use level",
+     OptionParser::parseEmitSwitch,
+     "some",
+     {"none", "some", "all"}},
+    {OptionKind::INC_DEC,
+     "",
+     "--inc-dec",
+     true,
+     "Spell step-by-one reductions as ++/-- (C/C++ only)",
+     "Can't parse inc-dec use level",
+     OptionParser::parseIncDec,
+     "some",
+     {"none", "some", "all"}},
+    {OptionKind::COMPOUND_ASSIGN,
+     "",
+     "--compound-assign",
+     true,
+     "Fold plain assignments into compound assignments (C/C++ only)",
+     "Can't parse compound-assign use level",
+     OptionParser::parseCompoundAssign,
+     "some",
+     {"none", "some", "all"}},
 };
 
 static void dumpVersion(std::ostream &stream) {
@@ -530,6 +584,49 @@ void OptionParser::parseMaxArrayDims(std::string max_array_dims_str) {
     } catch (std::exception &) {
         printHelpAndExit("Can't parse max array dims");
     }
+}
+
+// All of the extended-feature knobs share the none/some/all shape.
+static OptionLevel parseOptionLevel(std::string val, const char *what,
+                                    void (*fail)(std::string)) {
+    if (val == "none")
+        return OptionLevel::NONE;
+    if (val == "some")
+        return OptionLevel::SOME;
+    if (val == "all")
+        return OptionLevel::ALL;
+    fail(std::string("Can't recognize ") + what + " use level");
+    return OptionLevel::NONE;
+}
+
+void OptionParser::parseCVQualifiers(std::string val) {
+    Options::getInstance().setCVQualifiers(
+        parseOptionLevel(std::move(val), "cv-qualifiers", printHelpAndExit));
+}
+
+void OptionParser::parseLoopForms(std::string val) {
+    Options::getInstance().setLoopForms(
+        parseOptionLevel(std::move(val), "loop-forms", printHelpAndExit));
+}
+
+void OptionParser::parseLoopJumps(std::string val) {
+    Options::getInstance().setLoopJumps(
+        parseOptionLevel(std::move(val), "loop-jumps", printHelpAndExit));
+}
+
+void OptionParser::parseEmitSwitch(std::string val) {
+    Options::getInstance().setEmitSwitch(
+        parseOptionLevel(std::move(val), "emit-switch", printHelpAndExit));
+}
+
+void OptionParser::parseIncDec(std::string val) {
+    Options::getInstance().setIncDec(
+        parseOptionLevel(std::move(val), "inc-dec", printHelpAndExit));
+}
+
+void OptionParser::parseCompoundAssign(std::string val) {
+    Options::getInstance().setCompoundAssign(
+        parseOptionLevel(std::move(val), "compound-assign", printHelpAndExit));
 }
 
 void Options::dump(std::ostream &stream) {

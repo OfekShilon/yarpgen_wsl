@@ -66,6 +66,11 @@ GenPolicy::GenPolicy() {
     }
     stmt_kind_struct_distr.emplace_back(
         Probability<IRNodeKind>{IRNodeKind::IF_ELSE, 10});
+    if (options.extendedFeaturesSupported() &&
+        options.getEmitSwitch() != OptionLevel::NONE)
+        stmt_kind_struct_distr.emplace_back(Probability<IRNodeKind>{
+            IRNodeKind::SWITCH,
+            options.getEmitSwitch() == OptionLevel::ALL ? 30u : 10u});
     stmt_kind_struct_distr.emplace_back(
         Probability<IRNodeKind>{IRNodeKind::STUB, 70});
     shuffleProbProxy(stmt_kind_struct_distr);
@@ -424,6 +429,120 @@ GenPolicy::GenPolicy() {
     vectorizable_loop_distr.emplace_back(true, 20);
     vectorizable_loop_distr.emplace_back(false, 70);
     shuffleProbProxy(vectorizable_loop_distr);
+
+    // Everything below is gated on its feature being enabled, and deliberately
+    // so: shuffleProbProxy() draws from the global RNG (parameter shuffling is
+    // on by default), so merely *constructing* a distribution shifts the random
+    // stream and changes which program a given seed produces. Building these
+    // only on demand keeps a fully disabled run bit-for-bit identical to the
+    // generator before these features existed, which is what makes existing
+    // reproducers still reproduce.
+    if (!options.extendedFeaturesSupported())
+        return;
+
+    if (options.getCVQualifiers() != OptionLevel::NONE) {
+        // A volatile array or input variable suppresses vectorization of
+        // every loop that touches it, so these stay rare on purpose: they add
+        // a few heavily-constrained tests, they do not blunt the whole corpus.
+        inp_var_cv_qual_distr.emplace_back(CVQualifier::NONE, 75);
+        inp_var_cv_qual_distr.emplace_back(CVQualifier::CONST, 20);
+        inp_var_cv_qual_distr.emplace_back(CVQualifier::VOLAT, 5);
+        shuffleProbProxy(inp_var_cv_qual_distr);
+
+        out_var_cv_qual_distr.emplace_back(CVQualifier::NONE, 92);
+        out_var_cv_qual_distr.emplace_back(CVQualifier::VOLAT, 8);
+        shuffleProbProxy(out_var_cv_qual_distr);
+
+        arr_cv_qual_distr.emplace_back(CVQualifier::NONE, 96);
+        arr_cv_qual_distr.emplace_back(CVQualifier::VOLAT, 4);
+        shuffleProbProxy(arr_cv_qual_distr);
+    }
+
+    if (options.getLoopForms() != OptionLevel::NONE) {
+        loop_form_distr.emplace_back(LoopForm::FOR, 70);
+        loop_form_distr.emplace_back(LoopForm::WHILE, 20);
+        loop_form_distr.emplace_back(LoopForm::DO_WHILE, 10);
+        shuffleProbProxy(loop_form_distr);
+    }
+
+    if (options.getLoopJumps() != OptionLevel::NONE) {
+        loop_jump_distr.emplace_back(LoopJumpKind::NONE, 70);
+        loop_jump_distr.emplace_back(LoopJumpKind::BREAK, 15);
+        loop_jump_distr.emplace_back(LoopJumpKind::CONT_NEVER, 8);
+        loop_jump_distr.emplace_back(LoopJumpKind::CONT_PREFIX, 7);
+        shuffleProbProxy(loop_jump_distr);
+
+        // 100 means the exit is never taken, which is the case that stresses
+        // early-exit vectorization hardest, so it gets the largest share.
+        break_keep_percent_distr.emplace_back(25, 15);
+        break_keep_percent_distr.emplace_back(50, 25);
+        break_keep_percent_distr.emplace_back(75, 20);
+        break_keep_percent_distr.emplace_back(100, 40);
+        shuffleProbProxy(break_keep_percent_distr);
+
+        uniformProbFromMax(cont_skip_num_distr, 4, 1);
+
+        hide_jump_bound_distr.emplace_back(true, 70);
+        hide_jump_bound_distr.emplace_back(false, 30);
+        shuffleProbProxy(hide_jump_bound_distr);
+    }
+
+    if (options.getEmitSwitch() != OptionLevel::NONE) {
+        switch_case_num_distr.emplace_back(2, 30);
+        switch_case_num_distr.emplace_back(3, 30);
+        switch_case_num_distr.emplace_back(4, 25);
+        switch_case_num_distr.emplace_back(5, 15);
+        shuffleProbProxy(switch_case_num_distr);
+
+        switch_case_matches_distr.emplace_back(true, 75);
+        switch_case_matches_distr.emplace_back(false, 25);
+        shuffleProbProxy(switch_case_matches_distr);
+
+        switch_fallthrough_distr.emplace_back(true, 25);
+        switch_fallthrough_distr.emplace_back(false, 75);
+        shuffleProbProxy(switch_fallthrough_distr);
+
+        switch_has_default_distr.emplace_back(true, 60);
+        switch_has_default_distr.emplace_back(false, 40);
+        shuffleProbProxy(switch_has_default_distr);
+
+        switch_dense_labels_distr.emplace_back(true, 50);
+        switch_dense_labels_distr.emplace_back(false, 50);
+        shuffleProbProxy(switch_dense_labels_distr);
+    }
+
+    if (options.getIncDec() != OptionLevel::NONE) {
+        use_inc_dec_distr.emplace_back(true, 25);
+        use_inc_dec_distr.emplace_back(false, 75);
+        shuffleProbProxy(use_inc_dec_distr);
+
+        inc_dec_kind_distr.emplace_back(IncDecKind::PRE_INC, 30);
+        inc_dec_kind_distr.emplace_back(IncDecKind::POST_INC, 30);
+        inc_dec_kind_distr.emplace_back(IncDecKind::PRE_DEC, 20);
+        inc_dec_kind_distr.emplace_back(IncDecKind::POST_DEC, 20);
+        shuffleProbProxy(inc_dec_kind_distr);
+    }
+
+    if (options.getCompoundAssign() != OptionLevel::NONE) {
+        use_compound_assign_distr.emplace_back(true, 40);
+        use_compound_assign_distr.emplace_back(false, 60);
+        shuffleProbProxy(use_compound_assign_distr);
+
+        // The ten operators that have a compound form. Shifts, division and
+        // modulo are only reachable here: they are excluded from reductions
+        // because they are not safe to repeat.
+        compound_assign_op_distr.emplace_back(BinaryOp::ADD, 10);
+        compound_assign_op_distr.emplace_back(BinaryOp::SUB, 10);
+        compound_assign_op_distr.emplace_back(BinaryOp::MUL, 10);
+        compound_assign_op_distr.emplace_back(BinaryOp::DIV, 10);
+        compound_assign_op_distr.emplace_back(BinaryOp::MOD, 10);
+        compound_assign_op_distr.emplace_back(BinaryOp::BIT_AND, 10);
+        compound_assign_op_distr.emplace_back(BinaryOp::BIT_OR, 10);
+        compound_assign_op_distr.emplace_back(BinaryOp::BIT_XOR, 10);
+        compound_assign_op_distr.emplace_back(BinaryOp::SHL, 10);
+        compound_assign_op_distr.emplace_back(BinaryOp::SHR, 10);
+        shuffleProbProxy(compound_assign_op_distr);
+    }
 }
 
 void GenPolicy::makeVectorizable() {

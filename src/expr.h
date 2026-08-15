@@ -66,6 +66,15 @@ class Expr : public IRNode {
     // case of UB for multiple values
     virtual std::shared_ptr<Expr> copy() = 0;
 
+    // True if emitting this expression yields a volatile-qualified lvalue.
+    //
+    // std::min/std::max take `const T&`, so template deduction sees `volatile
+    // int` for a volatile argument and `int` for a plain one and finds no
+    // match. Such arguments have to be turned into prvalues with an explicit
+    // cast first. Only lvalue-producing nodes need to answer true; every
+    // arithmetic node already yields a prvalue.
+    virtual bool yieldsVolatileLvalue() { return false; }
+
   protected:
     std::shared_ptr<Data> value;
 
@@ -133,6 +142,11 @@ class ScalarVarUseExpr : public VarUseExpr {
 
     std::shared_ptr<Expr> copy() final;
 
+    bool yieldsVolatileLvalue() final {
+        return value->getDeclCVQualifier() == CVQualifier::VOLAT ||
+               value->getDeclCVQualifier() == CVQualifier::CONST_VOLAT;
+    }
+
   private:
     static std::unordered_map<std::shared_ptr<Data>,
                               std::shared_ptr<ScalarVarUseExpr>>
@@ -158,6 +172,11 @@ class ArrayUseExpr : public VarUseExpr {
     };
 
     std::shared_ptr<Expr> copy() final;
+
+    bool yieldsVolatileLvalue() final {
+        return value->getDeclCVQualifier() == CVQualifier::VOLAT ||
+               value->getDeclCVQualifier() == CVQualifier::CONST_VOLAT;
+    }
 
   private:
     static std::unordered_map<std::shared_ptr<Data>,
@@ -208,6 +227,9 @@ class TypeCastExpr : public Expr {
     create(std::shared_ptr<PopulateCtx> ctx);
 
     std::shared_ptr<Expr> copy() final;
+
+    bool isImplicit() { return is_implicit; }
+    std::shared_ptr<Expr> getExpr() { return expr; }
 
   private:
     std::shared_ptr<Expr> expr;
@@ -268,6 +290,10 @@ class BinaryExpr : public ArithmeticExpr {
 
     std::shared_ptr<Expr> copy() final;
 
+    BinaryOp getOp() { return op; }
+    std::shared_ptr<Expr> getLhs() { return lhs; }
+    std::shared_ptr<Expr> getRhs() { return rhs; }
+
   private:
     BinaryOp op;
     std::shared_ptr<Expr> lhs;
@@ -290,6 +316,11 @@ class TernaryExpr : public ArithmeticExpr {
     create(std::shared_ptr<PopulateCtx> ctx);
 
     std::shared_ptr<Expr> copy() final;
+
+    bool yieldsVolatileLvalue() final {
+        return true_br->yieldsVolatileLvalue() ||
+               false_br->yieldsVolatileLvalue();
+    }
 
   private:
     std::shared_ptr<Expr> cond;
@@ -323,6 +354,10 @@ class SubscriptExpr : public Expr {
     void setIsDead(bool val);
 
     std::shared_ptr<Expr> copy() final;
+
+    bool yieldsVolatileLvalue() final {
+        return array->yieldsVolatileLvalue();
+    }
 
   private:
     static std::shared_ptr<SubscriptExpr>
@@ -360,14 +395,33 @@ class AssignmentExpr : public Expr {
 
     void emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
               std::string offset = "") override;
+    // allow_compound is false when the caller intends to wrap the result in
+    // something else that owns the operator (ReductionExpr does).
     static std::shared_ptr<AssignmentExpr>
-    create(std::shared_ptr<PopulateCtx> ctx);
+    create(std::shared_ptr<PopulateCtx> ctx, bool allow_compound = true);
 
     std::shared_ptr<Expr> copy() override;
 
     std::shared_ptr<Expr> getTo() { return to; }
 
+    // Rewrite this assignment into `to op= rhs` by replacing `from` with
+    // `to op from`. Nothing else changes: type propagation, evaluation and UB
+    // rebuilding all run on the resulting tree exactly as they would on the
+    // spelled-out `to = to op from`, which is what makes the compound form free
+    // of new correctness obligations. Only emit() differs.
+    void makeCompound(BinaryOp op);
+
+    // Replace the assigned expression. Used to pin a reduction's step to the
+    // literal 1 so that it can be spelled ++/--.
+    void setFrom(std::shared_ptr<Expr> _from) { from = std::move(_from); }
+
   protected:
+    // True when the tree still has the shape makeCompound() produced, so the
+    // compound spelling is still faithful to what evaluate() computed.
+    // rebuild() is free to rewrite the operand that holds `to`, in which case
+    // we must fall back to the plain `to = <expr>` form.
+    bool compoundFormIsValid();
+
     std::shared_ptr<Expr> from;
     // TODO: fold into a single array
     std::shared_ptr<Expr> second_from;
@@ -375,6 +429,11 @@ class AssignmentExpr : public Expr {
     std::shared_ptr<Expr> to;
     // Iterator that we use to fix UB in case of multiple values
     std::shared_ptr<Iterator> versioning_iter;
+
+    // Set by makeCompound(): the BinaryExpr that `from` was replaced with, and
+    // the copy of `to` that became its left operand.
+    std::shared_ptr<BinaryExpr> compound_binary;
+    std::shared_ptr<Expr> compound_to_copy;
 };
 
 class ReductionExpr : public AssignmentExpr {
@@ -385,6 +444,8 @@ class ReductionExpr : public AssignmentExpr {
         : AssignmentExpr(*_expr), bin_op(_bin_op), lib_call_kind(_lib_call),
           is_degenerate(_is_degenerate) {}
     IRNodeKind getKind() final { return IRNodeKind::REDUCTION; }
+
+    void setIncDecKind(IncDecKind _kind) { inc_dec_kind = _kind; }
 
     bool propagateType() final;
     EvalResType evaluate(EvalCtx &ctx) final;
@@ -401,6 +462,9 @@ class ReductionExpr : public AssignmentExpr {
   private:
     BinaryOp bin_op;
     LibCallKind lib_call_kind;
+    // When set, this reduction steps by exactly one and is spelled ++/--.
+    // MAX_INC_DEC_KIND means "spell it as op=".
+    IncDecKind inc_dec_kind = IncDecKind::MAX_INC_DEC_KIND;
     std::shared_ptr<Expr> result_expr;
     // This member indicates if we want to use a simple AssignmentExpr as a
     // fallback option for reduction

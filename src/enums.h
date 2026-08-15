@@ -99,6 +99,7 @@ enum class IRNodeKind {
     LOOP_SEQ,
     LOOP_NEST,
     IF_ELSE,
+    SWITCH,
     STUB,
     MAX_STMT_KIND,
     // Fake node kinds so we can use Probability mechanism
@@ -145,6 +146,40 @@ enum class LibCallKind {
 
 enum class LoopEndKind { CONST, VAR, EXPR, MAX_LOOP_KIND };
 
+// The syntactic form used to emit a counted loop. All three forms iterate over
+// exactly the same iteration space; only the spelling differs, which is enough
+// to send the compiler down different loop-recognition paths (rotation,
+// latch/exit placement, guard insertion).
+// DO_WHILE executes the body at least once, so it must not be used for
+// degenerate (zero-trip) loops.
+enum class LoopForm { FOR, WHILE, DO_WHILE, MAX_LOOP_FORM };
+
+// A jump statement injected at the top of a loop body. Every kind keeps the
+// number of executed iterations exactly computable at generation time, so
+// value tracking (and therefore reduction UB detection) stays precise:
+// - BREAK       exits after a chosen iteration; the trip count is truncated.
+// - CONT_NEVER  a continue whose condition is never true; the trip count is
+//               unchanged, but the body gains a second latch edge.
+// - CONT_PREFIX a continue that skips a chosen number of leading iterations;
+//               the trip count shrinks by exactly that number, and the final
+//               iteration still runs so last-write values are unaffected.
+enum class LoopJumpKind {
+    NONE,
+    BREAK,
+    CONT_NEVER,
+    CONT_PREFIX,
+    MAX_LOOP_JUMP_KIND
+};
+
+// Spelling of a "step by one" update.
+enum class IncDecKind {
+    PRE_INC,
+    POST_INC,
+    PRE_DEC,
+    POST_DEC,
+    MAX_INC_DEC_KIND
+};
+
 enum class OptionKind {
     HELP,
     VERSION,
@@ -164,6 +199,12 @@ enum class OptionKind {
     MUTATION_SEED,
     UB_IN_DC,
     MAX_ARRAY_DIMS,
+    CV_QUALIFIERS,
+    LOOP_FORMS,
+    LOOP_JUMPS,
+    EMIT_SWITCH,
+    INC_DEC,
+    COMPOUND_ASSIGN,
     MAX_OPTION_ID
 };
 

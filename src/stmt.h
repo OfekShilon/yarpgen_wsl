@@ -106,6 +106,14 @@ class ScopeStmt : public StmtBlock {
               std::string offset = "") final;
     static std::shared_ptr<ScopeStmt>
     generateStructure(std::shared_ptr<GenCtx> ctx);
+
+    // Emit the scope's statements without the enclosing braces. A loop needs
+    // this so that it can place its break/continue guard and its iterator
+    // update inside the body's own braces.
+    void emitBody(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                  std::string offset = "") {
+        StmtBlock::emit(ctx, stream, std::move(offset));
+    }
 };
 
 class LoopStmt : public Stmt {};
@@ -128,7 +136,9 @@ class LoopHead {
   public:
     LoopHead()
         : prefix(nullptr), suffix(nullptr), is_foreach(false),
-          same_iter_space(false), vectorizable(false) {}
+          same_iter_space(false), vectorizable(false), form(LoopForm::FOR),
+          jump_kind(LoopJumpKind::NONE), jump_bound(0),
+          hide_jump_bound(false) {}
 
     std::shared_ptr<StmtBlock> getPrefix() { return prefix; }
     void addPrefix(std::shared_ptr<StmtBlock> _prefix) {
@@ -149,6 +159,25 @@ class LoopHead {
     void emitSuffix(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
                     std::string offset = "");
 
+    // The three loop forms differ in where the iterator's declaration and its
+    // update live, so emitting one is split into four pieces that the enclosing
+    // statement interleaves with the body:
+    //
+    //   FOR:      emitHeader "{" body emitBodyEnd "}" emitFooter
+    //             for (i = s; i < e; i += k) { <body> }
+    //   WHILE:      { T i = s; while (i < e) { <body> i += k; } }
+    //   DO_WHILE:   { T i = s; do { <body> i += k; } while (i < e); }
+    //
+    // emitBodyStart emits the break/continue guard, which always goes first so
+    // that the number of executed iterations stays exactly what
+    // populateIterators() recorded.
+    void emitBodyStart(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                       std::string offset = "");
+    void emitBodyEnd(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                     std::string offset = "");
+    void emitFooter(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                    std::string offset = "");
+
     void setIsForeach(bool _val) { is_foreach = _val; }
     bool isForeach() { return is_foreach; }
 
@@ -163,7 +192,31 @@ class LoopHead {
 
     void setVectorizable() { vectorizable = true; }
 
+    LoopForm getForm() { return form; }
+    LoopJumpKind getJumpKind() { return jump_kind; }
+
+    // Choose a loop form and a break/continue guard, and truncate the
+    // iterator's trip count to match. Must run after createPragmas() (an
+    // OpenMP simd loop may not be branched out of) and before the body is
+    // populated (reductions read the trip count).
+    void chooseFormAndJump(const std::shared_ptr<PopulateCtx> &ctx);
+    // Copy the form and guard from another head. Used for the loops of a
+    // same-iteration-space group, which share an iterator's parameters and
+    // trip count and therefore must share its guard too.
+    void copyFormAndJump(const std::shared_ptr<LoopHead> &other);
+
   private:
+    // Emit the loop's controlling condition, e.g. "i_0 < 20".
+    void emitCondition(std::shared_ptr<EmitCtx> ctx, std::ostream &stream);
+    // Emit the iterator declarations that a while/do-while form has to hoist
+    // out of the loop, e.g. "int i_0 = 0;".
+    void emitIterDecls(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                       std::string offset);
+    // Emit the iterator updates that a while/do-while form has to append to
+    // the body, e.g. "i_0 += 1;".
+    void emitIterSteps(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+                       std::string offset);
+
     std::shared_ptr<StmtBlock> prefix;
     // Loop iterations space is defined by the iterators that we can use
     std::vector<std::shared_ptr<Iterator>> iters;
@@ -179,6 +232,20 @@ class LoopHead {
     bool same_iter_space;
 
     bool vectorizable;
+
+    LoopForm form;
+
+    // The break/continue guard. jump_bound is an absolute iterator value: a
+    // BREAK fires on the first iteration whose value reaches it, a CONT_PREFIX
+    // skips every iteration below it, and a CONT_NEVER uses a bound at or below
+    // the start value so the condition is never true.
+    LoopJumpKind jump_kind;
+    int64_t jump_bound;
+    // Add `+ zero` to the bound. `zero` is an extern variable that is zero at
+    // run time, so the guard keeps its meaning while becoming opaque to
+    // constant folding -- without it the compiler would simply recompute the
+    // trip count and the second exit would disappear.
+    bool hide_jump_bound;
 };
 
 // According to the agreement, a single standalone loop should be represented as
@@ -262,6 +329,48 @@ class IfElseStmt : public Stmt {
     std::shared_ptr<Expr> cond;
     std::shared_ptr<ScopeStmt> then_br;
     std::shared_ptr<ScopeStmt> else_br;
+};
+
+// A switch statement.
+//
+// Like IfElseStmt, this relies on the controlling expression's value being
+// known at generation time: that tells us exactly which case runs, so the
+// `taken` flag each body gets is as precise as it is for an if-else. What
+// switch adds over an if-else chain is the lowering: dense labels become a
+// jump table, a sparse set becomes a comparison chain or a bit test, and
+// fall-through produces a CFG an if-else cannot express.
+class SwitchStmt : public Stmt {
+  public:
+    SwitchStmt() = default;
+    IRNodeKind getKind() final { return IRNodeKind::SWITCH; }
+    void emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
+              std::string offset = "") final;
+    static std::shared_ptr<SwitchStmt>
+    generateStructure(std::shared_ptr<GenCtx> ctx);
+    void populate(std::shared_ptr<PopulateCtx> ctx) final;
+
+    bool detectNestedForeach() override {
+        bool ret = std::accumulate(
+            cases.begin(), cases.end(), false,
+            [](bool acc, const CaseBlock &c) {
+                return acc || c.body->detectNestedForeach();
+            });
+        return ret || (default_br.use_count() != 0 &&
+                       default_br->detectNestedForeach());
+    }
+
+  private:
+    struct CaseBlock {
+        std::shared_ptr<ScopeStmt> body;
+        // The label's value. Only meaningful once populate() has chosen it.
+        IRValue label;
+        // If true this case omits its `break` and falls into the next one.
+        bool falls_through = false;
+    };
+
+    std::shared_ptr<Expr> cond;
+    std::vector<CaseBlock> cases;
+    std::shared_ptr<ScopeStmt> default_br;
 };
 
 class StubStmt : public Stmt {
