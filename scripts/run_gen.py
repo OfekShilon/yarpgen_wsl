@@ -1704,6 +1704,12 @@ class CustomFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescri
     pass
 
 if __name__ == '__main__':
+    # Worker processes rely on inheriting global state (logger,
+    # CompilerSpecs.all_comp_specs, ...) set up here in the parent, which
+    # only works with 'fork' semantics. Python 3.14 changed the default
+    # start method on Linux to 'forkserver', which breaks that.
+    multiprocessing.set_start_method("fork")
+
     if os.environ.get("YARPGEN_HOME") is None:
         sys.stderr.write("\nWarning: please set YARPGEN_HOME environment variable to point to yarpgen's directory,"
                          " using " + common.yarpgen_home + " for now\n")

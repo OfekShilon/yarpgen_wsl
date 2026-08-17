@@ -33,24 +33,24 @@ import run_gen
 
 
 icc_blame_opts = ["-from_rtn=0 -to_rtn=", "-num_opt=", "-num-case="]
-icc_opt_patterns = ["\(\d+\)", "\(\d+\)\s*\n", "DO ANOTHER.*\(\d+\)"]
-icc_opt_name_prefix = "DOING\s*\[\w*\]\s*"
-icc_opt_name_suffix = "\s*\(\d*\)\s*\(last opt\)"
+icc_opt_patterns = [r"\(\d+\)", r"\(\d+\)\s*\n", r"DO ANOTHER.*\(\d+\)"]
+icc_opt_name_prefix = r"DOING\s*\[\w*\]\s*"
+icc_opt_name_suffix = r"\s*\(\d*\)\s*\(last opt\)"
 
 icx_blame_opts = ["-mllvm -opt-bisect-limit="]
-icx_opt_patterns = ["BISECT: running pass \(\d+\)"]
-icx_opt_name_prefix = "BISECT: running pass \(\d+\) "
-icx_opt_name_suffix = " \(.*\)"
+icx_opt_patterns = [r"BISECT: running pass \(\d+\)"]
+icx_opt_name_prefix = r"BISECT: running pass \(\d+\) "
+icx_opt_name_suffix = r" \(.*\)"
 
 clang_blame_opts = ["-mllvm -opt-bisect-limit="]
-clang_opt_patterns = ["BISECT: running pass \(\d+\)"]
-clang_opt_name_prefix = "BISECT: running pass \(\d+\) "
-clang_opt_name_suffix = " \(.*\)"
+clang_opt_patterns = [r"BISECT: running pass \(\d+\)"]
+clang_opt_name_prefix = r"BISECT: running pass \(\d+\) "
+clang_opt_name_suffix = r" \(.*\)"
 
 dpcpp_gpu_blame_opts = ["IGC_ShaderDumpEnableAll=1 IGC_ShaderDisableOptPassesAfter="]
-dpcpp_gpu_patterns = ["Skipping optimization pass: .* (threshold: \(\d+\))."]
+dpcpp_gpu_patterns = [r"Skipping optimization pass: .* (threshold: \(\d+\))."]
 dpcpp_gpu_opt_name_prefix = "Skipping optimization pass: '"
-dpcpp_gpu_opt_name_suffix = "' \(.*\)."
+dpcpp_gpu_opt_name_suffix = r"' \(.*\)."
 
 compilers_blame_opts = {"icc": icc_blame_opts, "icx": icx_blame_opts, "clang": clang_blame_opts, "dpcpp": dpcpp_gpu_blame_opts}
 compilers_blame_patterns = {"icc": icc_opt_patterns, "icx": icx_opt_patterns, "clang": clang_opt_patterns, "dpcpp": dpcpp_gpu_patterns}
@@ -109,7 +109,7 @@ def execute_blame_phase(valid_res, fail_target, inject_str, num, phase_num):
             if phase_num == 2 and not matches:
                 return str(-1)
             max_opt_num_str = matches[-1]
-            remove_brackets_pattern = re.compile("\d+")
+            remove_brackets_pattern = re.compile(r"\d+")
             max_opt_num = int(remove_brackets_pattern.findall(max_opt_num_str)[-1])
             common.log_msg(logging.DEBUG, "Max opt num (process " + str(num) + "): " + str(max_opt_num))
     except IndexError:

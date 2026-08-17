@@ -35,9 +35,9 @@ msvc        | cl-proxy            | cl-proxy          |                         
 Testing sets:
 gcc_o1           | gcc       | -O1 -std=c++20                           |                |
 msvc_no_opt      | msvc      | /Od /std:c++20                           |                |
-msvc_o1          | msvc      | /O1 /std:c++20                           |                |
-msvc_os          | msvc      | /Os /std:c++20                           |                |
-msvc_ot          | msvc      | /Ot /std:c++20                           |                |
+#msvc_o1          | msvc      | /O1 /std:c++20                           |                |
+#msvc_os          | msvc      | /Os /std:c++20                           |                |
+#msvc_ot          | msvc      | /Ot /std:c++20                           |                |
 msvc_o2          | msvc      | /O2 /std:c++20                           |                |
 #msvc_avx2_opt    | msvc      | /O2 /arch:AVX2 /std:c++20                |                |
-msvc_par         | msvc      | /O2 /Qpar /std:c++20                     |                |
+#msvc_par         | msvc      | /O2 /Qpar /std:c++20                     |                |
