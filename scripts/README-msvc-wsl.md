@@ -20,9 +20,14 @@ presents a GCC/Clang-style command line and forwards to MSVC — the same idea a
 
 ## Running
 
+One time build:
+```sh
+mkdir build && cd build && cmake .. && make
+```
+
 For a 1h run:
 ```sh
-export YARPGEN_HOME=/path/to/yarpgen          # else run_gen.py warns and assumes $PWD
+export YARPGEN_HOME=/path/to/yarpgen
 export PATH="$YARPGEN_HOME/scripts:$PATH"
 
 mkdir -p /mnt/c/yarpgen-scratch && cd /mnt/c/yarpgen-scratch
