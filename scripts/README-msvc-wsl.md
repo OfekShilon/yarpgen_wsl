@@ -45,10 +45,13 @@ cap](#why-the-array-dimension-cap)).
 MSVC runs off its own config, [`test_sets_msvc.txt`](test_sets_msvc.txt), passed
 with `--config-file`; the default `test_sets.txt` has no MSVC entries. You can:
 
-- **Add a set** to widen the search. Spell the flags the MSVC way (`/O2 /Qpar`).
-- **Comment a set out** to get through more programs. At the 8 sets shipped here
-  each program costs 8 compiles and 8 runs; halving that roughly doubles the
-  number of programs a night's run covers.
+- **Add a set** (or uncomment one of the pre-listed but disabled ones) to widen
+  the search. Spell the flags the MSVC way (`/O2 /Qpar`).
+- **Comment a set out** to get through more programs. 
+The default here ships with 3 active sets (`gcc_o1`, `msvc_no_opt`, `msvc_o2`), 
+so each program costs 3 compiles and 3 runs; There are 5 additional sets commented out
+(`o1`, `os`, `ot`, `avx2`, `par`) that can be easily added back - increasing that cost proportionally
+and shrinking the number of programs a night's run covers.
 
 Every shipped set pins `/std:c++20` explicitly, and you can modify it or add sets
 with a different value. Without the explicit switches gcc compiles

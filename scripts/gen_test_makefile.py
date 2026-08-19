@@ -341,7 +341,7 @@ def gen_makefile(out_file_name, force, config_file, only_target=None, inject_bla
         optflags_str += "\n"
         output += optflags_str
         # For performance reasons driver should always be compiled with -O0
-        output += re.sub("-O\d", "-O0", (optflags_str.replace("OPTFLAGS", "DRIVER_OPTFLAGS")))
+        output += re.sub(r"-O\d", "-O0", (optflags_str.replace("OPTFLAGS", "DRIVER_OPTFLAGS")))
 
         if inject_blame_opt is not None:
             output += target.name + ": " + "BLAMEOPTS=" + inject_blame_opt + "\n"
