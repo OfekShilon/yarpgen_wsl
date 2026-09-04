@@ -189,7 +189,6 @@ enum class PragmaKind {
     CLANG_INTERLEAVE,
     CLANG_VEC_PREDICATE,
     CLANG_UNROLL,
-    OMP_SIMD,
     MAX_PRAGMA_KIND,
 };
 

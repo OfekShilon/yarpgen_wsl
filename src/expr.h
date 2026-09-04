@@ -381,10 +381,9 @@ class ReductionExpr : public AssignmentExpr {
   public:
     ReductionExpr(std::shared_ptr<AssignmentExpr> _expr, BinaryOp _bin_op,
                   LibCallKind _lib_call, bool _is_degenerate,
-                  bool _is_omp_reduction, bool _taken = true)
+                  bool _taken = true)
         : AssignmentExpr(*_expr), bin_op(_bin_op), lib_call_kind(_lib_call),
-          is_degenerate(_is_degenerate),
-          is_omp_reduction(_is_omp_reduction) {}
+          is_degenerate(_is_degenerate) {}
     IRNodeKind getKind() final { return IRNodeKind::REDUCTION; }
 
     bool propagateType() final;
@@ -399,15 +398,6 @@ class ReductionExpr : public AssignmentExpr {
 
     std::shared_ptr<Expr> copy() final;
 
-    // rebuild() can turn a real reduction into a degenerate (plain
-    // assignment, no self-reference) one to dodge UB, so callers that care
-    // whether this still behaves as an OpenMP-reduction-shaped update must
-    // check this only after rebuild() has run, not right after create().
-    bool isDegenerate() { return is_degenerate; }
-    // Valid only when !isDegenerate(): the OpenMP "reduction(<op>:...)"
-    // identifier matching this node's operation.
-    std::string getOmpReductionOp();
-
   private:
     BinaryOp bin_op;
     LibCallKind lib_call_kind;
@@ -415,12 +405,6 @@ class ReductionExpr : public AssignmentExpr {
     // This member indicates if we want to use a simple AssignmentExpr as a
     // fallback option for reduction
     bool is_degenerate;
-    // Set when this node sits under a "#pragma omp simd", i.e. when it may end
-    // up as a list item of that pragma's "reduction(...)" clause. Only then is
-    // an implementation allowed to re-associate the accumulation, so only then
-    // does evaluate() have to check the extra orders - see
-    // reductionPartialsHelper.
-    bool is_omp_reduction;
 };
 
 class CallExpr : public Expr {

@@ -229,8 +229,6 @@ GenPolicy::GenPolicy() {
         Probability<PragmaKind>(PragmaKind::CLANG_VEC_PREDICATE, 20));
     pragma_kind_distr.emplace_back(
         Probability<PragmaKind>(PragmaKind::CLANG_UNROLL, 20));
-    pragma_kind_distr.emplace_back(
-        Probability<PragmaKind>(PragmaKind::OMP_SIMD, 20));
     shuffleProbProxy(pragma_kind_distr);
 
     active_similar_op = SimilarOperators::MAX_SIMILAR_OP;
@@ -351,6 +349,8 @@ GenPolicy::GenPolicy() {
     stencil_dim_num_distr.emplace_back(4, 10);
     shuffleProbProxy(stencil_dim_num_distr);
 
+    require_full_dims_arrays = false;
+
     array_dims_num_limit = 7;
     // It looks like ISPC has trouble allocating arrays that require a lot of
     // memory. We limit the number of dimensions to 4.
@@ -363,6 +363,8 @@ GenPolicy::GenPolicy() {
     if (options.getMaxArrayDims() != 0)
         array_dims_num_limit =
             std::min(array_dims_num_limit, options.getMaxArrayDims());
+
+    array_dims_num_ceiling = array_dims_num_limit;
 
     // Arrays with single dimension require a separate treatment. Otherwise, we
     // do not get the desired distribution.
@@ -421,12 +423,12 @@ GenPolicy::GenPolicy() {
     hide_zero_in_versioning_prob.emplace_back(true, 50);
     hide_zero_in_versioning_prob.emplace_back(false, 50);
 
-    vectorizable_loop_distr.emplace_back(true, 20);
-    vectorizable_loop_distr.emplace_back(false, 70);
+    vectorizable_loop_distr.emplace_back(true, 40);
+    vectorizable_loop_distr.emplace_back(false, 60);
     shuffleProbProxy(vectorizable_loop_distr);
 }
 
-void GenPolicy::makeVectorizable(bool simple) {
+void GenPolicy::makeVectorizable(bool simple, size_t loop_depth) {
     Options &options = Options::getInstance();
 
     removeProbability(stmt_kind_struct_distr, IRNodeKind::LOOP_NEST);
@@ -455,19 +457,47 @@ void GenPolicy::makeVectorizable(bool simple) {
     if (!simple)
         return;
 
+    // A nest whose depth was clamped to zero has no iterators at all
+    loop_depth = std::max(loop_depth, static_cast<size_t>(1));
+
     switch (options.getVectorizerTarget()) {
     case VectorizerTarget::MSVC:
-        applyMsvcConstraints();
+        applyMsvcConstraints(loop_depth);
         break;
     case VectorizerTarget::GCC_CLANG:
-        applyGccClangConstraints();
+        applyGccClangConstraints(loop_depth);
         break;
     default:
         break;
     }
+
+    // With a single iterator there is nothing to cover: every subscript kind
+    // maps the one dimension it has onto the one iterator in scope, so leave
+    // that (much more common) case exactly as it was.
+    if (loop_depth > 1) {
+        require_full_dims_arrays = true;
+
+        // Multiple values in an array make one of its axes belong to a
+        // single iterator, which overrides the in-order subscript that keeps
+        // the innermost dimension contiguous. See getSuitableArrays(). With
+        // one iterator the override picks that same iterator anyway.
+        loop_body_with_mul_vals_prob.clear();
+        loop_body_with_mul_vals_prob.emplace_back(false, 100);
+        array_with_mul_vals_prob.clear();
+        array_with_mul_vals_prob.emplace_back(false, 100);
+
+        // Every dimension of a new array is as long as the outermost loop's
+        // trip count (see ArrayType::create), so an array's size grows as
+        // trip_count ^ dimensions. Stay at the low end of the
+        // vectorizer-friendly trip counts and stop the body from nesting any
+        // deeper, otherwise the test's static data explodes.
+        iters_end_limit_min = 32;
+        iter_end_limit_max = 32;
+        loop_depth_limit = std::min(loop_depth_limit, loop_depth);
+    }
 }
 
-void GenPolicy::applyMsvcConstraints() {
+void GenPolicy::applyMsvcConstraints(size_t loop_depth) {
     // Narrow, pattern-matching vectorizers (e.g. MSVC's) only recognize a
     // single flat statement over 1-D, stride-1 array/scalar accesses, with a
     // known trip count and no nested control flow or calls. None of the
@@ -538,7 +568,9 @@ void GenPolicy::applyMsvcConstraints() {
     subs_diagonal_prob.clear();
     subs_diagonal_prob.emplace_back(false, 100);
 
-    array_dims_num_limit = 1;
+    // Exactly one dimension per loop level, so the innermost iterator always
+    // indexes the innermost (contiguous) dimension.
+    array_dims_num_limit = std::min(loop_depth, array_dims_num_ceiling);
     array_dims_use_kind.clear();
     array_dims_use_kind.emplace_back(ArrayDimsUseKind::SAME, 100);
 
@@ -569,7 +601,7 @@ void GenPolicy::applyMsvcConstraints() {
     pragma_kind_distr.clear();
 }
 
-void GenPolicy::applyGccClangConstraints() {
+void GenPolicy::applyGccClangConstraints(size_t loop_depth) {
     // GCC/Clang's loop vectorizer works over a whole basic block, not just a
     // single statement, and can if-convert a shallow branch into a select.
     // Nested control flow and calls are still off the table (set by the
@@ -655,8 +687,10 @@ void GenPolicy::applyGccClangConstraints() {
 
     // Multi-dimensional array access is fine as long as the innermost
     // dimension is still contiguous, which SubscriptOrderKind already
-    // ensures above.
-    array_dims_num_limit = 2;
+    // ensures above. One dimension per loop level is the baseline; one extra
+    // dimension is allowed, which makes IN_ORDER duplicate an iterator and
+    // yields a strided (rather than repeated) access.
+    array_dims_num_limit = std::min(loop_depth + 1, array_dims_num_ceiling);
     array_dims_use_kind.clear();
     array_dims_use_kind.emplace_back(ArrayDimsUseKind::SAME, 60);
     array_dims_use_kind.emplace_back(ArrayDimsUseKind::MORE, 40);

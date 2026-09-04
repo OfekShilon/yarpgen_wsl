@@ -83,18 +83,6 @@ std::shared_ptr<ExprStmt> ExprStmt::create(std::shared_ptr<PopulateCtx> ctx) {
     if (new_active_ctx->getAllowMulVals())
         expr->propagateValue(eval_ctx);
 
-    // Only register with the enclosing "#pragma omp simd"'s reduction
-    // clause now, since rebuild() (above) may have turned this into a
-    // degenerate plain assignment (no self-reference on "to") to dodge UB,
-    // in which case it must NOT be advertised as a reduction.
-    if (expr_kind == IRNodeKind::REDUCTION && new_active_ctx->isInsideOMPSimd() &&
-        new_active_ctx->getOmpReductionVars() != nullptr) {
-        auto reduction_expr = std::static_pointer_cast<ReductionExpr>(expr);
-        if (!reduction_expr->isDegenerate())
-            new_active_ctx->getOmpReductionVars()->push_back(
-                {reduction_expr->getTo(), reduction_expr->getOmpReductionOp()});
-    }
-
     return std::make_shared<ExprStmt>(expr);
 }
 
@@ -315,24 +303,6 @@ void LoopHead::createPragmas(std::shared_ptr<PopulateCtx> ctx) {
     pragmas = Pragma::create(pragmas_num, ctx);
 }
 
-bool LoopHead::hasSIMDPragma() {
-    auto search_func = [](std::shared_ptr<Pragma> pragma) -> bool {
-        return pragma->getKind() == PragmaKind::OMP_SIMD;
-    };
-
-    return std::find_if(pragmas.begin(), pragmas.end(), search_func) !=
-           pragmas.end();
-}
-
-void LoopHead::setOmpReductionVars(std::vector<OmpReductionVar> vars) {
-    auto search_func = [](std::shared_ptr<Pragma> pragma) -> bool {
-        return pragma->getKind() == PragmaKind::OMP_SIMD;
-    };
-    auto found = std::find_if(pragmas.begin(), pragmas.end(), search_func);
-    if (found != pragmas.end())
-        (*found)->setReductionVars(std::move(vars));
-}
-
 void LoopHead::populateArrays(std::shared_ptr<PopulateCtx> ctx) {
     auto gen_pol = ctx->getGenPolicy();
     size_t new_arrays_num = rand_val_gen->getRandId(gen_pol->new_arr_num_distr);
@@ -402,7 +372,8 @@ LoopSeqStmt::generateStructure(std::shared_ptr<GenCtx> ctx) {
              rand_val_gen->getRandId(gen_pol->vectorizable_loop_distr));
         if (make_simple) {
             auto simple_gen_pol = std::make_shared<GenPolicy>(*gen_pol);
-            simple_gen_pol->makeVectorizable(/*simple*/ true);
+            simple_gen_pol->makeVectorizable(/*simple*/ true,
+                                             new_ctx->getLoopDepth());
             new_loop_head->setSimple();
             body_ctx = std::make_shared<GenCtx>(*new_ctx);
             body_ctx->setGenPolicy(simple_gen_pol);
@@ -464,34 +435,26 @@ void LoopSeqStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
             rand_val_gen->getRandId(gen_pol->vectorizable_loop_distr);
         if (vectorizable_loop) {
             active_gen_pol = std::make_shared<GenPolicy>(*gen_pol);
-            active_gen_pol->makeVectorizable(simple_loop);
+            // The array dimension caps are derived from how many loop
+            // levels enclose the body, which includes any loop we are
+            // nested in -- this loop adds one more dimension below.
+            active_gen_pol->makeVectorizable(
+                simple_loop, ctx->getDimensions().size() + 1);
             loop_head->setVectorizable();
             new_ctx->setGenPolicy(active_gen_pol);
+            // An enclosing loop may have set a multiple-values iterator; drop
+            // it, for the reason given in getSuitableArrays(). It only
+            // matters once several iterators are in scope, which is also
+            // when makeVectorizable() stops generating them.
+            if (simple_loop && active_gen_pol->require_full_dims_arrays)
+                new_ctx->setMulValsIter(nullptr);
         }
 
         loop_head->createPragmas(new_ctx);
-        bool old_simd_state = new_ctx->isInsideOMPSimd();
-        bool starts_omp_simd = !old_simd_state && loop_head->hasSIMDPragma();
-        new_ctx->setInsideOMPSimd(loop_head->hasSIMDPragma() || old_simd_state);
-        if (starts_omp_simd)
-            new_ctx->setOmpReductionVars(
-                std::make_shared<std::vector<OmpReductionVar>>());
 
         size_t new_dim = 0;
 
         std::shared_ptr<Iterator> new_iters = nullptr;
-        // Reusing the previous loop's iteration space copies its type, bounds
-        // and step verbatim. If that iterator was built outside a
-        // "#pragma omp simd" it may be a bool or carry a non-constant step,
-        // which would break OpenMP's canonical loop form here, so fall back to
-        // creating a fresh iterator instead.
-        if (same_iter_space_counter != 0 && new_ctx->isInsideOMPSimd() &&
-            !loops.at(cur_idx - 1)
-                 .first->getIterators()
-                 .front()
-                 ->isOmpCanonical())
-            same_iter_space_counter = 0;
-
         if (same_iter_space_counter == 0) {
             if (new_ctx->getDimensions().empty()) {
                 new_dim = makeMutableRoll(active_gen_pol, [&active_gen_pol]() {
@@ -522,7 +485,6 @@ void LoopSeqStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
                 prev_iter->getMaxRightOffset(), prev_iter->getStep(),
                 prev_iter->isDegenerate(), prev_iter->getTotalItersNum());
             new_iters->setIsDead(false);
-            new_iters->setOmpCanonical(prev_iter->isOmpCanonical());
             new_iters->setSupportsMulValues(prev_iter->getSupportsMulValues());
             new_iters->setMainValsOnLastIter(
                 prev_iter->getMainValsOnLastIter());
@@ -542,7 +504,8 @@ void LoopSeqStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
         bool body_with_mul_vals =
             new_ctx->getMulValsIter() == nullptr &&
             new_iters->getSupportsMulValues() &&
-            rand_val_gen->getRandId(gen_pol->loop_body_with_mul_vals_prob);
+            rand_val_gen->getRandId(
+                active_gen_pol->loop_body_with_mul_vals_prob);
         if (body_with_mul_vals) {
             new_ctx->setMulValsIter(new_iters);
             new_ctx->setAllowMulVals(true);
@@ -575,11 +538,6 @@ void LoopSeqStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
 
         loop.second->populate(new_ctx);
 
-        if (starts_omp_simd) {
-            loop_head->setOmpReductionVars(*new_ctx->getOmpReductionVars());
-            new_ctx->setOmpReductionVars(nullptr);
-        }
-
         // TODO: we create new context for each loop, so some of the cleanup is
         // not needed
         new_ctx->decLoopDepth(1);
@@ -587,7 +545,6 @@ void LoopSeqStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
         new_ctx->deleteLastDim();
         new_ctx->setInsideForeach(ctx->isInsideForeach());
         new_ctx->setTaken(old_ctx_state);
-        new_ctx->setInsideOMPSimd(old_simd_state);
         if (loop_head->getSuffix().use_count() != 0)
             loop_head->getSuffix()->populate(new_ctx);
 
@@ -629,10 +586,31 @@ LoopNestStmt::generateStructure(std::shared_ptr<GenCtx> ctx) {
 
     Options &options = Options::getInstance();
 
+    OptionLevel simple_loops = options.getSimpleLoops();
+    size_t outer_depth = ctx->getLoopDepth();
+    bool make_simple =
+        nest_depth > 0 &&
+        (simple_loops == OptionLevel::ALL ||
+         (simple_loops == OptionLevel::SOME &&
+          rand_val_gen->getRandId(gen_pol->vectorizable_loop_distr)));
+    // Every level of the nest contributes an iterator to the single shared
+    // body, and a simple body needs one array dimension per iterator -- the
+    // enclosing loops' iterators included -- so the nest can't be deeper
+    // than what is left of the array dimension cap.
+    if (make_simple) {
+        size_t dims_left = gen_pol->array_dims_num_limit > outer_depth
+                               ? gen_pol->array_dims_num_limit - outer_depth
+                               : 0;
+        nest_depth = std::min(nest_depth, dims_left);
+        make_simple = nest_depth > 0;
+    }
+
     auto new_loop_nest = std::make_shared<LoopNestStmt>();
     auto new_ctx = std::make_shared<GenCtx>(*ctx);
     for (size_t i = 0; i < nest_depth; ++i) {
         auto new_loop = std::make_shared<LoopHead>();
+        if (make_simple)
+            new_loop->setSimple();
 
         bool gen_foreach = false;
         if (options.isISPC())
@@ -650,7 +628,19 @@ LoopNestStmt::generateStructure(std::shared_ptr<GenCtx> ctx) {
     stats.addStmt(nest_depth);
 
     new_ctx->incLoopDepth(nest_depth);
-    new_loop_nest->addBody(ScopeStmt::generateStructure(new_ctx));
+
+    // Same reasoning as in LoopSeqStmt::generateStructure: the body's
+    // statement structure is fixed here, so a nest that should stay flat has
+    // to be constrained before ScopeStmt::generateStructure runs.
+    auto body_ctx = new_ctx;
+    if (make_simple) {
+        auto simple_gen_pol = std::make_shared<GenPolicy>(*gen_pol);
+        simple_gen_pol->makeVectorizable(/*simple*/ true,
+                                         outer_depth + nest_depth);
+        body_ctx = std::make_shared<GenCtx>(*new_ctx);
+        body_ctx->setGenPolicy(simple_gen_pol);
+    }
+    new_loop_nest->addBody(ScopeStmt::generateStructure(body_ctx));
 
     return new_loop_nest;
 }
@@ -658,9 +648,28 @@ LoopNestStmt::generateStructure(std::shared_ptr<GenCtx> ctx) {
 void LoopNestStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
     auto gen_pol = ctx->getGenPolicy();
     auto new_ctx = std::make_shared<PopulateCtx>(ctx);
+
+    // If the body was already constrained to a simple shape at
+    // structure-generation time, honor that decision here instead of
+    // re-rolling it. Unlike LoopSeqStmt we don't roll a plain "vectorizable"
+    // nest on top of that: all the levels share one body, so there is no
+    // per-loop body to constrain independently.
+    bool simple_nest = !loops.empty() && loops.front()->isSimple();
+    if (simple_nest) {
+        gen_pol = std::make_shared<GenPolicy>(*gen_pol);
+        gen_pol->makeVectorizable(/*simple*/ true,
+                                  ctx->getDimensions().size() + loops.size());
+        for (auto &loop : loops)
+            loop->setVectorizable();
+        new_ctx->setGenPolicy(gen_pol);
+        // An enclosing loop may have set a multiple-values iterator; drop it,
+        // for the reason given in getSuitableArrays().
+        if (gen_pol->require_full_dims_arrays)
+            new_ctx->setMulValsIter(nullptr);
+    }
+
     bool old_ctx_state = new_ctx->isTaken();
     auto taken_switch_id = loops.end();
-    auto simd_switch_id = loops.end();
     auto mul_val_loop_idx = loops.end();
     for (auto i = loops.begin(); i != loops.end(); ++i) {
         if ((*i)->getPrefix().use_count() != 0) {
@@ -669,12 +678,6 @@ void LoopNestStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
         }
 
         (*i)->createPragmas(new_ctx);
-        if (simd_switch_id == loops.end() && (*i)->hasSIMDPragma()) {
-            new_ctx->setInsideOMPSimd(true);
-            new_ctx->setOmpReductionVars(
-                std::make_shared<std::vector<OmpReductionVar>>());
-            simd_switch_id = i;
-        }
 
         size_t new_dim = 0;
         if (new_ctx->getDimensions().empty()) {
@@ -705,7 +708,13 @@ void LoopNestStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
         }
 
         new_ctx->addDimension(new_dim);
-        LoopHead::populateArrays(new_ctx);
+        // A simple nest needs every array it touches to have one dimension
+        // per level, so arrays are created only once the full dimension list
+        // is known, at the innermost level. The outer levels have nothing to
+        // populate anyway: their body is the next loop, and a simple nest
+        // uses constant bounds, so no array is needed to build them.
+        if (!simple_nest || std::next(i) == loops.end())
+            LoopHead::populateArrays(new_ctx);
 
         new_ctx->getLocalSymTable()->addIters(new_iters);
 
@@ -718,11 +727,6 @@ void LoopNestStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
 
     body->populate(new_ctx);
 
-    if (simd_switch_id != loops.end()) {
-        (*simd_switch_id)->setOmpReductionVars(*new_ctx->getOmpReductionVars());
-        new_ctx->setOmpReductionVars(nullptr);
-    }
-
     for (auto i = loops.begin(); i != loops.end(); ++i) {
         new_ctx->decLoopDepth(1);
         new_ctx->getLocalSymTable()->deleteLastIters();
@@ -733,8 +737,6 @@ void LoopNestStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
         }
         if (i == taken_switch_id)
             new_ctx->setTaken(old_ctx_state);
-        if (i == simd_switch_id)
-            new_ctx->setInsideOMPSimd(ctx->isInsideOMPSimd());
         if ((*i)->isForeach())
             new_ctx->setInsideForeach(ctx->isInsideForeach());
         if ((*i)->getSuffix().use_count() != 0)
@@ -843,33 +845,6 @@ void Pragma::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         case PragmaKind::CLANG_UNROLL:
             clang_emit_helper("unroll");
             break;
-        case PragmaKind::OMP_SIMD: {
-            stream << "omp simd";
-            // Group reduction variables by their OpenMP reduction
-            // identifier, since each identifier needs its own clause:
-            // "reduction(+:a,b) reduction(*:c)".
-            std::vector<std::pair<std::string, std::vector<std::shared_ptr<Expr>>>>
-                grouped;
-            for (auto &red_var : reduction_vars) {
-                auto group = std::find_if(
-                    grouped.begin(), grouped.end(),
-                    [&red_var](auto &g) { return g.first == red_var.op; });
-                if (group == grouped.end())
-                    grouped.push_back({red_var.op, {red_var.var}});
-                else
-                    group->second.push_back(red_var.var);
-            }
-            for (auto &group : grouped) {
-                stream << " reduction(" << group.first << ":";
-                for (size_t i = 0; i < group.second.size(); ++i) {
-                    if (i != 0)
-                        stream << ", ";
-                    group.second.at(i)->emit(ctx, stream);
-                }
-                stream << ")";
-            }
-            break;
-        }
         case PragmaKind::MAX_PRAGMA_KIND:
             ERROR("Bad PragmaKind");
     }
@@ -900,23 +875,13 @@ Pragma::create(size_t num, std::shared_ptr<PopulateCtx> ctx) {
                   vec.end());
     };
 
-    if (ctx->isInsideOMPSimd()) {
-        modify_disrt(PragmaKind::OMP_SIMD);
-        if (tmp_gen_pol->pragma_kind_distr.empty())
-            return {};
-    }
     tmp_ctx->setGenPolicy(tmp_gen_pol);
 
     for (size_t i = 0; i < num; ++i) {
         auto new_pragma = create(tmp_ctx);
         PragmaKind kind =
             std::static_pointer_cast<Pragma>(new_pragma)->getKind();
-        // TODO: we need a smarter way to put them in right order
-        if (kind == PragmaKind::OMP_SIMD)
-            // Clang's pragmas want to be next to a loop
-            pragmas.insert(pragmas.begin(), new_pragma);
-        else
-            pragmas.push_back(new_pragma);
+        pragmas.push_back(new_pragma);
         modify_disrt(kind);
         if (tmp_gen_pol->pragma_kind_distr.empty())
             break;

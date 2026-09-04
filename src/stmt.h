@@ -120,16 +120,8 @@ class Pragma {
     static std::vector<std::shared_ptr<Pragma>>
     create(size_t num, std::shared_ptr<PopulateCtx> ctx);
 
-    // Only meaningful for OMP_SIMD: the scalar reductions the loop's body
-    // performs, discovered while populating it (see PopulateCtx's
-    // omp_reduction_vars), so we can emit a matching "reduction(...)" clause.
-    void setReductionVars(std::vector<OmpReductionVar> _vars) {
-        reduction_vars = std::move(_vars);
-    }
-
   private:
     PragmaKind kind;
-    std::vector<OmpReductionVar> reduction_vars;
 };
 
 class LoopHead {
@@ -163,10 +155,6 @@ class LoopHead {
     std::shared_ptr<Iterator>
     populateIterators(std::shared_ptr<PopulateCtx> ctx, size_t _end_val);
     void createPragmas(std::shared_ptr<PopulateCtx> ctx);
-    bool hasSIMDPragma();
-    // Attaches the reductions found while populating this loop's body to its
-    // OMP_SIMD pragma (a no-op if it doesn't have one).
-    void setOmpReductionVars(std::vector<OmpReductionVar> vars);
 
     static void populateArrays(std::shared_ptr<PopulateCtx> ctx);
 

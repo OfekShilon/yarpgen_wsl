@@ -186,6 +186,20 @@ class GenPolicy {
     double arrays_dims_ext_factor = 1.3;
     // TODO: this seems like it doesn't work, so we will have to fix it
     size_t array_dims_num_limit;
+    // The hard ceiling on array_dims_num_limit, fixed by the constructor
+    // (and --max-array-dims): stencil_in_dim_prob only has entries for
+    // 1..array_dims_num_ceiling, so nothing may raise the limit past it.
+    // The "simple" profiles need it because they derive the limit from the
+    // loop depth and must not clamp against an already-lowered limit that a
+    // shallower enclosing loop left behind.
+    size_t array_dims_num_ceiling;
+    // When set, a subscript may only use an array that has at least one
+    // dimension per enclosing loop level. Without it an array with fewer
+    // dimensions gets indexed by an arbitrary subset of the iterators, which
+    // can leave out the innermost one and turn the access into a repeated
+    // read/write of the same element -- a cross-iteration dependency that
+    // blocks vectorization. Only the "simple" profiles set it.
+    bool require_full_dims_arrays;
 
     std::vector<Probability<bool>> use_iters_cache_prob;
 
@@ -203,17 +217,21 @@ class GenPolicy {
     // "simple" additionally constrains the loop to a shape that the
     // Options::getVectorizerTarget() vectorizer can recognize: no nested
     // control flow and a small, mostly flat body.
-    void makeVectorizable(bool simple = false);
+    // "loop_depth" is the number of loop levels that share that body (1 for
+    // a plain loop, the nest depth for a loop nest). Every level contributes
+    // an iterator, and the array dimension caps below are derived from it.
+    void makeVectorizable(bool simple = false, size_t loop_depth = 1);
 
   private:
-    // Narrowest profile: a single flat statement over 1-D, stride-1
-    // array/scalar accesses, with a known trip count and no nested control
-    // flow or calls. Matches MSVC's pattern-matching vectorizer.
-    void applyMsvcConstraints();
+    // Narrowest profile: a single flat statement over stride-1 array/scalar
+    // accesses with one dimension per loop level, a known trip count and no
+    // nested control flow or calls. Matches MSVC's pattern-matching
+    // vectorizer.
+    void applyMsvcConstraints(size_t loop_depth);
     // Looser profile for GCC/Clang's more general vectorizer: allows a
     // multi-statement body, simple if-conversion, reductions, deeper
     // expressions, and a wider range of strides/types/binary ops.
-    void applyGccClangConstraints();
+    void applyGccClangConstraints(size_t loop_depth);
 
     template <typename T>
     void uniformProbFromMax(std::vector<Probability<T>> &distr, size_t max_num,

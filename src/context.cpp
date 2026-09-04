@@ -40,8 +40,6 @@ PopulateCtx::PopulateCtx(std::shared_ptr<PopulateCtx> _par_ctx)
         taken = par_ctx->isTaken();
         inside_foreach = par_ctx->isInsideForeach();
         inside_mutation = par_ctx->isInsideMutation();
-        inside_omp_simd = par_ctx->inside_omp_simd;
-        omp_reduction_vars = par_ctx->omp_reduction_vars;
         dims = par_ctx->dims;
         in_stencil = par_ctx->in_stencil;
         mul_vals_iter = par_ctx->mul_vals_iter;
@@ -57,8 +55,6 @@ PopulateCtx::PopulateCtx() {
     arith_depth = 0;
     taken = true;
     inside_mutation = false;
-    inside_omp_simd = false;
-    omp_reduction_vars = nullptr;
     in_stencil = false;
     mul_vals_iter = nullptr;
     allow_mul_vals = false;
