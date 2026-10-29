@@ -200,6 +200,48 @@ class GenPolicy {
     std::vector<Probability<size_t>> same_iter_space_span_distr;
 
     std::vector<Probability<bool>> vectorizable_loop_distr;
+
+    // Heap views (see Options::getAlias())
+    // Whether an array becomes a view into a heap buffer
+    std::vector<Probability<bool>> heap_view_prob;
+    // Same for output scalar variables, which become "T *var" parameters
+    std::vector<Probability<bool>> scalar_view_prob;
+    std::vector<Probability<ViewKind>> view_kind_distr;
+    // Whether a view goes to the same buffer as the previous view of the same
+    // type, or starts a new buffer
+    std::vector<Probability<bool>> share_buffer_prob;
+    // Distance (in elements) between neighboring views in a buffer
+    std::vector<Probability<size_t>> view_gap_distr;
+    // Offset (in elements) of the first view in a buffer. Non-zero values
+    // break the alignment that malloc gives
+    std::vector<Probability<size_t>> buffer_misalign_distr;
+    // Whether a view that overlaps nothing else gets a restrict qualifier
+    // (only for --emit-restrict=some)
+    std::vector<Probability<bool>> emit_restrict_prob;
+    // Whether a new output array / scalar variable gets an alias hint, i.e.,
+    // the layout tries to overlap it with one of the recent outputs
+    // (only for --alias=stores and above)
+    std::vector<Probability<bool>> alias_out_arr_prob;
+    std::vector<Probability<bool>> alias_out_var_prob;
+    // How many of the most recent output arrays (and scalar variables) are
+    // the candidates for an alias hint
+    size_t alias_candidates_num;
+    std::vector<Probability<AliasDistKind>> alias_dist_distr;
+    std::vector<Probability<size_t>> alias_small_dist_distr;
+    // Opaque inputs (only for --alias=loads), see Data::isOpaque()
+    // Number of opaque input arrays that we create in each loop scope, on top
+    // of the regular ones
+    std::vector<Probability<size_t>> opaque_inp_arr_num_distr;
+    // Whether an assignment computes an opaque expression
+    std::vector<Probability<bool>> opaque_expr_prob;
+    // Whether a subscript in an opaque expression prefers opaque inputs
+    std::vector<Probability<bool>> opaque_arr_use_prob;
+    // Whether the output of an opaque expression gets an alias hint to one of
+    // the opaque inputs that it reads
+    std::vector<Probability<bool>> alias_opaque_target_prob;
+    // Restricts the distributions to the expressions that are well defined
+    // for any values of their leaves (see PopulateCtx::isOpaqueMode())
+    void makeOpaque();
     // "simple" additionally constrains the loop to a shape that the
     // Options::getVectorizerTarget() vectorizer can recognize: no nested
     // control flow and a small, mostly flat body.

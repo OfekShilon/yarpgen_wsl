@@ -33,6 +33,31 @@ void ExprStmt::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
     stream << ";";
 }
 
+// With --alias=loads, an assignment may compute an opaque expression, which
+// can read opaque inputs. ProgramGenerator::layoutBuffers may overlap them with
+// outputs, so their values are unknown and the expression has to be well
+// defined for any values.
+static void rollOpaqueMode(std::shared_ptr<PopulateCtx> ctx) {
+    if (Options::getInstance().getAlias() < AliasLevel::LOADS ||
+        ctx->getLocalSymTable()->getIters().empty())
+        return;
+    ctx->setOpaqueMode(true);
+    auto avail_arrs = SubscriptExpr::getSuitableArrays(ctx);
+    bool has_opaque = std::any_of(
+        avail_arrs.begin(), avail_arrs.end(),
+        [](const std::shared_ptr<Array> &arr) { return arr->isOpaque(); });
+    if (!has_opaque ||
+        !rand_val_gen->getRandId(ctx->getGenPolicy()->opaque_expr_prob)) {
+        ctx->setOpaqueMode(false);
+        return;
+    }
+    ctx->setAllowMulVals(false);
+    ctx->setOpaqueReads(std::make_shared<std::vector<std::shared_ptr<Data>>>());
+    auto new_gen_pol = std::make_shared<GenPolicy>(*ctx->getGenPolicy());
+    new_gen_pol->makeOpaque();
+    ctx->setGenPolicy(new_gen_pol);
+}
+
 std::shared_ptr<ExprStmt> ExprStmt::create(std::shared_ptr<PopulateCtx> ctx) {
     auto gen_pol = ctx->getGenPolicy();
 
@@ -55,6 +80,7 @@ std::shared_ptr<ExprStmt> ExprStmt::create(std::shared_ptr<PopulateCtx> ctx) {
             : rand_val_gen->getRandId(gen_pol->expr_stmt_kind_pop_distr);
 
     if (expr_kind == IRNodeKind::ASSIGN) {
+        rollOpaqueMode(new_active_ctx);
         expr = AssignmentExpr::create(new_active_ctx);
         total_iters_num = -1;
     }
@@ -93,6 +119,18 @@ std::shared_ptr<ExprStmt> ExprStmt::create(std::shared_ptr<PopulateCtx> ctx) {
         if (!reduction_expr->isDegenerate())
             new_active_ctx->getOmpReductionVars()->push_back(
                 {reduction_expr->getTo(), reduction_expr->getOmpReductionOp()});
+    }
+
+    // Same as above, the final kind of the reduction is only known now
+    if (expr_kind == IRNodeKind::REDUCTION) {
+        auto reduction_expr = std::static_pointer_cast<ReductionExpr>(expr);
+        if (!reduction_expr->isSafeWithAnyValue()) {
+            // Array reductions are only "&" and "|"
+            if (reduction_expr->getTo()->getKind() !=
+                IRNodeKind::SCALAR_VAR_USE)
+                ERROR("Unsafe reduction to an array");
+            reduction_expr->getTo()->getValue()->setOverlapAllowed(false);
+        }
     }
 
     return std::make_shared<ExprStmt>(expr);
@@ -339,6 +377,21 @@ void LoopHead::populateArrays(std::shared_ptr<PopulateCtx> ctx) {
     for (size_t i = 0; i < new_arrays_num; ++i) {
         ctx->getExtInpSymTable()->addArray(Array::create(ctx, true));
     }
+
+    // Opaque inputs come on top of the regular ones, and only opaque
+    // expressions can read them (see SubscriptExpr::getSuitableArrays)
+    if (Options::getInstance().getAlias() < AliasLevel::LOADS)
+        return;
+    // Their values don't matter, so keep them simple
+    auto opaque_ctx = std::make_shared<PopulateCtx>(*ctx);
+    opaque_ctx->setAllowMulVals(false);
+    size_t opaque_arrays_num =
+        rand_val_gen->getRandId(gen_pol->opaque_inp_arr_num_distr);
+    for (size_t i = 0; i < opaque_arrays_num; ++i) {
+        auto new_array = Array::create(opaque_ctx, true);
+        new_array->setOpaque(true);
+        ctx->getExtInpSymTable()->addArray(new_array);
+    }
 }
 
 std::shared_ptr<Iterator>
@@ -474,9 +527,11 @@ void LoopSeqStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
         bool old_simd_state = new_ctx->isInsideOMPSimd();
         bool starts_omp_simd = !old_simd_state && loop_head->hasSIMDPragma();
         new_ctx->setInsideOMPSimd(loop_head->hasSIMDPragma() || old_simd_state);
-        if (starts_omp_simd)
+        if (starts_omp_simd) {
             new_ctx->setOmpReductionVars(
                 std::make_shared<std::vector<OmpReductionVar>>());
+            new_ctx->startOMPSimdRegion();
+        }
 
         size_t new_dim = 0;
 
@@ -718,6 +773,7 @@ void LoopNestStmt::populate(std::shared_ptr<PopulateCtx> ctx) {
             new_ctx->setInsideOMPSimd(true);
             new_ctx->setOmpReductionVars(
                 std::make_shared<std::vector<OmpReductionVar>>());
+            new_ctx->startOMPSimdRegion();
             simd_switch_id = i;
         }
 
@@ -936,9 +992,11 @@ Pragma::create(size_t num, std::shared_ptr<PopulateCtx> ctx) {
     auto tmp_ctx = std::make_shared<PopulateCtx>(*ctx);
     auto tmp_gen_pol = std::make_shared<GenPolicy>(*(tmp_ctx->getGenPolicy()));
 
+    // Also drop the kinds that shuffling left with zero weight, otherwise
+    // once only those remain the distribution has no weight at all.
     auto modify_disrt = [&tmp_gen_pol](PragmaKind _kind) {
         auto search_func = [&_kind](Probability<PragmaKind> &elem) -> bool {
-            return elem.getId() == _kind;
+            return elem.getId() == _kind || elem.getProb() == 0;
         };
         auto &vec = tmp_gen_pol->pragma_kind_distr;
         vec.erase(std::remove_if(vec.begin(), vec.end(), search_func),

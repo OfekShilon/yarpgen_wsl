@@ -126,7 +126,11 @@ class ScalarVarUseExpr : public VarUseExpr {
 
     void emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
               std::string offset = "") final {
-        stream << offset << value->getName(ctx);
+        // Views are passed to the test function as pointers
+        if (value->isView())
+            stream << offset << "(*" << value->getName(ctx) << ")";
+        else
+            stream << offset << value->getName(ctx);
     };
     static std::shared_ptr<ScalarVarUseExpr>
     create(std::shared_ptr<PopulateCtx> ctx);
@@ -328,6 +332,7 @@ class SubscriptExpr : public Expr {
     static std::shared_ptr<SubscriptExpr>
     initImpl(ArrayStencilParams array_params, std::shared_ptr<PopulateCtx> ctx);
     bool inBounds(size_t dim, std::shared_ptr<Data> idx_val, EvalCtx &ctx);
+    bool emitLinearized(std::shared_ptr<EmitCtx> ctx, std::ostream &stream);
 
     void setOffset(int64_t _offset) { stencil_offset = _offset; }
     int64_t getOffset() { return stencil_offset; }
@@ -407,6 +412,10 @@ class ReductionExpr : public AssignmentExpr {
     // Valid only when !isDegenerate(): the OpenMP "reduction(<op>:...)"
     // identifier matching this node's operation.
     std::string getOmpReductionOp();
+    // True if the reduction has no UB whatever value its target holds before
+    // it. An output that overlaps other outputs may be clobbered by them, so
+    // the value that the reduction reads back is unknown.
+    bool isSafeWithAnyValue();
 
   private:
     BinaryOp bin_op;
@@ -480,11 +489,11 @@ class MinCall : public MinMaxCallBase {
         : MinMaxCallBase(std::move(_a), std::move(_b), LibCallKind::MIN) {}
     static std::shared_ptr<LibCallExpr>
     create(std::shared_ptr<PopulateCtx> ctx) {
-        return createHelper(std::move(ctx), LibCallKind::MIN);
+        return createHelper(std::move(ctx), LibCallKind::MAX);
     }
     static void emitCDefinition(std::shared_ptr<EmitCtx> ctx,
                                 std::ostream &stream, std::string offset = "") {
-        emitCDefinitionImpl(ctx, stream, offset, LibCallKind::MAX);
+        emitCDefinitionImpl(ctx, stream, offset, LibCallKind::MIN);
     }
     std::shared_ptr<Expr> copy() final {
         auto new_a = a->copy();
@@ -499,11 +508,11 @@ class MaxCall : public MinMaxCallBase {
         : MinMaxCallBase(std::move(_a), std::move(_b), LibCallKind::MAX) {}
     static std::shared_ptr<LibCallExpr>
     create(std::shared_ptr<PopulateCtx> ctx) {
-        return createHelper(std::move(ctx), LibCallKind::MAX);
+        return createHelper(std::move(ctx), LibCallKind::MIN);
     }
     static void emitCDefinition(std::shared_ptr<EmitCtx> ctx,
                                 std::ostream &stream, std::string offset = "") {
-        emitCDefinitionImpl(ctx, stream, offset, LibCallKind::MIN);
+        emitCDefinitionImpl(ctx, stream, offset, LibCallKind::MAX);
     }
     std::shared_ptr<Expr> copy() final {
         auto new_a = a->copy();

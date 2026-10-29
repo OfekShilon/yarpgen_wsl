@@ -20,8 +20,10 @@ limitations under the License.
 #include "emit_policy.h"
 #include "stmt.h"
 #include <fstream>
+#include <map>
 #include <memory>
 #include <sstream>
+#include <unordered_map>
 
 using namespace yarpgen;
 
@@ -59,11 +61,350 @@ ProgramGenerator::ProgramGenerator() : hash_seed(0) {
         IRValue(IntTypeID::INT, IRValue::AbsValue{false, 0}));
     zero_var->setIsDead(false);
     ext_inp_sym_tbl->addVar(zero_var);
+
+    // We have to do it after the generation, when we know what arrays are
+    // actually used
+    if (Options::getInstance().useHeapViews())
+        layoutBuffers(gen_pol);
+}
+
+// Distance between the start of the "target" view and the start of the view
+// that should overlap it
+static int64_t pickAliasDist(std::shared_ptr<GenPolicy> gen_pol,
+                             const std::shared_ptr<Data> &target,
+                             const std::shared_ptr<Data> &view) {
+    auto target_len = static_cast<int64_t>(target->getElemsNum());
+    auto view_len = static_cast<int64_t>(view->getElemsNum());
+    // The views overlap iff the distance is in [min_dist, max_dist]
+    int64_t min_dist = -(view_len - 1);
+    int64_t max_dist = target_len - 1;
+    // Two scalars
+    if (min_dist == max_dist)
+        return 0;
+
+    int64_t dist = 0;
+    switch (rand_val_gen->getRandId(gen_pol->alias_dist_distr)) {
+        case AliasDistKind::ZERO:
+            return 0;
+        case AliasDistKind::SMALL:
+            dist = static_cast<int64_t>(
+                rand_val_gen->getRandId(gen_pol->alias_small_dist_distr));
+            break;
+        case AliasDistKind::STRIDE: {
+            std::vector<size_t> strides;
+            for (auto &data : {target, view})
+                if (data->isArray()) {
+                    auto arr_strides =
+                        std::static_pointer_cast<Array>(data)->getStrides();
+                    strides.insert(strides.end(), arr_strides.begin(),
+                                   arr_strides.end());
+                }
+            if (!strides.empty())
+                dist = static_cast<int64_t>(rand_val_gen->getRandElem(strides));
+            break;
+        }
+        case AliasDistKind::RANDOM:
+            return rand_val_gen->getRandValue(min_dist, max_dist);
+        case AliasDistKind::MAX_ALIAS_DIST_KIND:
+            ERROR("Bad AliasDistKind");
+    }
+    if (rand_val_gen->getRandValue(false, true))
+        dist = -dist;
+    if (dist < min_dist || dist > max_dist)
+        dist = -dist;
+    if (dist < min_dist || dist > max_dist)
+        dist = rand_val_gen->getRandValue(min_dist, max_dist);
+    return dist;
+}
+
+static bool rangesOverlap(int64_t a_begin, int64_t a_end, int64_t b_begin,
+                          int64_t b_end) {
+    return a_begin < b_end && b_begin < a_end;
+}
+
+// Two outputs may overlap only if the result doesn't depend on the order of
+// the stores to them, or the compiler has to keep that order
+static bool outputsOverlapAllowed(const std::shared_ptr<Data> &a,
+                                  const std::shared_ptr<Data> &b) {
+    if (!a->getOverlapAllowed() || !b->getOverlapAllowed())
+        return false;
+    // "#pragma omp simd" lets the compiler reorder stores of different
+    // iterations
+    return a->getOMPSimdRegion() == 0 ||
+           a->getOMPSimdRegion() != b->getOMPSimdRegion();
+}
+
+void ProgramGenerator::layoutBuffers(std::shared_ptr<GenPolicy> gen_pol) {
+    Options &options = Options::getInstance();
+    auto is_live = [&options](const std::shared_ptr<Data> &data) {
+        return options.getAllowDeadData() || !data->getIsDead();
+    };
+    // Scalar outputs of "#pragma omp simd" loops are named in the reduction
+    // clause, so they can't be pointers
+    auto can_be_view = [&is_live](const std::shared_ptr<Data> &data) {
+        if (data->isScalarVar() && data->getOMPSimdRegion() != 0)
+            return false;
+        return is_live(data);
+    };
+
+    // The views that may overlap something: outputs and opaque inputs
+    std::vector<std::shared_ptr<Data>> nodes;
+    for (auto &var : ext_out_sym_tbl->getVars())
+        nodes.push_back(var);
+    for (auto &array : ext_out_sym_tbl->getArrays())
+        nodes.push_back(array);
+    size_t outs_num = nodes.size();
+    for (auto &array : ext_inp_sym_tbl->getArrays())
+        if (array->isOpaque())
+            nodes.push_back(array);
+    std::unordered_map<Data *, size_t> node_idx;
+    for (size_t i = 0; i < nodes.size(); ++i)
+        node_idx[nodes.at(i).get()] = i;
+    auto is_out = [&node_idx, outs_num](const std::shared_ptr<Data> &data) {
+        auto find_res = node_idx.find(data.get());
+        return find_res != node_idx.end() && find_res->second < outs_num;
+    };
+
+    auto overlap_allowed = [&is_out](const std::shared_ptr<Data> &a,
+                                     const std::shared_ptr<Data> &b) {
+        bool a_out = is_out(a);
+        bool b_out = is_out(b);
+        // We need to know the values of regular inputs. Opaque inputs are
+        // read only by the expressions that are well defined for any values.
+        if ((!a_out && !a->isOpaque()) || (!b_out && !b->isOpaque()))
+            return false;
+        if (a_out && b_out)
+            return outputsOverlapAllowed(a, b);
+        // Inputs are never written
+        if (!a_out && !b_out)
+            return true;
+        auto &inp = a_out ? b : a;
+        auto &out = a_out ? a : b;
+        // "#pragma omp simd" promises that there are no loop-carried
+        // dependencies
+        return out->getOMPSimdRegion() == 0 ||
+               !inp->isReadInOMPSimdRegion(out->getOMPSimdRegion());
+    };
+
+    // A block is a set of views with fixed offsets relative to each other.
+    // Each block goes into a buffer as a whole.
+    struct Block {
+        std::vector<std::pair<std::shared_ptr<Data>, size_t>> views;
+        size_t size = 0;
+    };
+    std::vector<Block> blocks;
+    std::vector<bool> in_group(nodes.size(), false);
+
+    // Alias hints form trees: each output points to an older output or to an
+    // opaque input. Each tree becomes a block, where the views overlap their
+    // targets.
+    auto valid_target = [&](size_t i) -> int64_t {
+        auto &view = nodes.at(i);
+        auto target = view->getAliasTarget();
+        if (!target || !can_be_view(view))
+            return -1;
+        auto find_res = node_idx.find(target.get());
+        if (find_res == node_idx.end() || !can_be_view(target) ||
+            !overlap_allowed(view, target))
+            return -1;
+        return static_cast<int64_t>(find_res->second);
+    };
+    std::vector<std::vector<size_t>> children(nodes.size());
+    std::vector<bool> has_target(nodes.size(), false);
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        int64_t target = valid_target(i);
+        if (target < 0)
+            continue;
+        children.at(target).push_back(i);
+        has_target.at(i) = true;
+    }
+    for (size_t root = 0; root < nodes.size(); ++root) {
+        if (has_target.at(root) || children.at(root).empty())
+            continue;
+        // Breadth-first, so that the targets are placed before the views
+        // that overlap them
+        std::vector<size_t> order = {root};
+        for (size_t i = 0; i < order.size(); ++i)
+            for (auto child : children.at(order.at(i)))
+                order.push_back(child);
+
+        std::unordered_map<size_t, int64_t> pos;
+        pos[root] = 0;
+        int64_t group_begin = 0;
+        auto group_end = static_cast<int64_t>(nodes.at(root)->getElemsNum());
+        for (size_t i = 1; i < order.size(); ++i) {
+            size_t cur = order.at(i);
+            auto &view = nodes.at(cur);
+            auto len = static_cast<int64_t>(view->getElemsNum());
+            auto target = static_cast<size_t>(valid_target(cur));
+            // The view may also overlap something other than its target, and
+            // not everything can overlap, so we may need a few attempts
+            bool placed = false;
+            for (size_t attempt = 0; attempt < 4 && !placed; ++attempt) {
+                int64_t begin = pos.at(target) +
+                                pickAliasDist(gen_pol, nodes.at(target), view);
+                bool conflict = false;
+                for (size_t j = 0; j < i; ++j) {
+                    size_t other = order.at(j);
+                    auto other_len =
+                        static_cast<int64_t>(nodes.at(other)->getElemsNum());
+                    if (rangesOverlap(begin, begin + len, pos.at(other),
+                                      pos.at(other) + other_len) &&
+                        !overlap_allowed(view, nodes.at(other)))
+                        conflict = true;
+                }
+                if (!conflict) {
+                    pos[cur] = begin;
+                    placed = true;
+                }
+            }
+            // Give up and put it after everything else
+            if (!placed)
+                pos[cur] =
+                    group_end + static_cast<int64_t>(rand_val_gen->getRandId(
+                                    gen_pol->view_gap_distr));
+            group_begin = std::min(group_begin, pos.at(cur));
+            group_end = std::max(group_end, pos.at(cur) + len);
+        }
+
+        Block block;
+        for (auto idx : order) {
+            block.views.emplace_back(
+                nodes.at(idx), static_cast<size_t>(pos.at(idx) - group_begin));
+            in_group.at(idx) = true;
+        }
+        block.size = static_cast<size_t>(group_end - group_begin);
+        blocks.push_back(block);
+    }
+
+    // Everything else may become a view on its own
+    auto add_single = [&](const std::shared_ptr<Data> &data,
+                          std::vector<Probability<bool>> &prob) {
+        if (!can_be_view(data) || !rand_val_gen->getRandId(prob))
+            return;
+        Block block;
+        block.views.emplace_back(data, 0);
+        block.size = data->getElemsNum();
+        blocks.push_back(block);
+    };
+    for (auto &array : ext_inp_sym_tbl->getArrays()) {
+        auto find_res = node_idx.find(array.get());
+        if (find_res != node_idx.end() && in_group.at(find_res->second))
+            continue;
+        add_single(array, gen_pol->heap_view_prob);
+    }
+    for (size_t i = 0; i < outs_num; ++i) {
+        if (in_group.at(i))
+            continue;
+        add_single(nodes.at(i), nodes.at(i)->isScalarVar()
+                                    ? gen_pol->scalar_view_prob
+                                    : gen_pol->heap_view_prob);
+    }
+
+    // Shuffle, so that inputs and outputs are interleaved in buffers
+    rand_val_gen->shuffleVector(blocks);
+
+    // For each type, the last buffer that new views can be appended to
+    std::map<IntTypeID, std::shared_ptr<Buffer>> open_buffers;
+    for (auto &block : blocks) {
+        auto first = block.views.front().first;
+        auto elem_type = first->getType();
+        if (elem_type->isArrayType())
+            elem_type =
+                std::static_pointer_cast<ArrayType>(elem_type)->getBaseType();
+        auto int_elem_type = std::static_pointer_cast<IntegralType>(elem_type);
+        IntTypeID type_id = int_elem_type->getIntTypeId();
+
+        std::shared_ptr<Buffer> buffer;
+        size_t offset = 0;
+        auto find_res = open_buffers.find(type_id);
+        if (find_res != open_buffers.end() &&
+            rand_val_gen->getRandId(gen_pol->share_buffer_prob)) {
+            buffer = find_res->second;
+            offset = buffer->getSize() +
+                     rand_val_gen->getRandId(gen_pol->view_gap_distr);
+        }
+        else {
+            buffer = std::make_shared<Buffer>(
+                "buf_" + std::to_string(buffers.size()), int_elem_type);
+            buffer->setFiller(rand_val_gen->getRandValue(type_id));
+            buffers.push_back(buffer);
+            open_buffers[type_id] = buffer;
+            offset = rand_val_gen->getRandId(gen_pol->buffer_misalign_distr);
+        }
+
+        for (auto &[view, rel_offset] : block.views) {
+            view->setBuffer(buffer, offset + rel_offset);
+            if (view->isArray())
+                std::static_pointer_cast<Array>(view)->setViewKind(
+                    rand_val_gen->getRandId(gen_pol->view_kind_distr));
+            buffer->addView(view);
+        }
+        buffer->setSize(offset + block.size);
+    }
+
+    for (auto &buffer : buffers) {
+        // Leave some space after the last view, so that stray writes past it
+        // still land in the buffer and change the hash
+        buffer->setSize(buffer->getSize() +
+                        rand_val_gen->getRandId(gen_pol->view_gap_distr));
+
+        auto &buf_views = buffer->getViews();
+        for (auto &view : buf_views) {
+            auto begin = static_cast<int64_t>(view->getBufOffset());
+            auto end = begin + static_cast<int64_t>(view->getElemsNum());
+            if (end > static_cast<int64_t>(buffer->getSize()))
+                ERROR("View is out of its buffer");
+            bool overlaps = false;
+            for (auto &other : buf_views) {
+                if (other == view)
+                    continue;
+                auto other_begin = static_cast<int64_t>(other->getBufOffset());
+                auto other_end =
+                    other_begin + static_cast<int64_t>(other->getElemsNum());
+                if (!rangesOverlap(begin, end, other_begin, other_end))
+                    continue;
+                overlaps = true;
+                if (!overlap_allowed(view, other) ||
+                    options.getAlias() < AliasLevel::STORES)
+                    ERROR("Bad overlap of " +
+                          view->getName(EmitCtx::default_emit_ctx) + " and " +
+                          other->getName(EmitCtx::default_emit_ctx));
+            }
+            // restrict promises that nothing else accesses the same memory
+            bool emit_restrict = false;
+            if (!overlaps) {
+                if (options.getEmitRestrict() == OptionLevel::ALL)
+                    emit_restrict = true;
+                else if (options.getEmitRestrict() == OptionLevel::SOME)
+                    emit_restrict =
+                        rand_val_gen->getRandId(gen_pol->emit_restrict_prob);
+            }
+            view->setEmitRestrict(emit_restrict);
+        }
+    }
+}
+
+std::vector<std::shared_ptr<Data>> ProgramGenerator::getParamViews() {
+    std::vector<std::shared_ptr<Data>> ret;
+    for (auto &sym_tbl : {ext_inp_sym_tbl, ext_out_sym_tbl}) {
+        for (auto &array : sym_tbl->getArrays())
+            if (array->isView())
+                ret.push_back(array);
+        for (auto &var : sym_tbl->getVars())
+            if (var->isView())
+                ret.push_back(var);
+    }
+    return ret;
 }
 
 void ProgramGenerator::emitCheckFunc(std::ostream &stream) {
     std::ostream &out_file = stream;
-    out_file << "#include <stdio.h>\n\n";
+    out_file << "#include <stdio.h>\n";
+    // We need malloc and free for heap buffers
+    if (!buffers.empty())
+        out_file << "#include <stdlib.h>\n";
+    out_file << "\n";
 
     Options &options = Options::getInstance();
     if (options.getCheckAlgo() == CheckAlgo::ASSERTS) {
@@ -88,6 +429,9 @@ static void emitVarsDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         ctx->setSYCLPrefix("app_");
     for (auto &var : vars) {
         if (!options.getAllowDeadData() && var->getIsDead())
+            continue;
+        // Views live in heap buffers
+        if (var->isView())
             continue;
         auto init_val = std::make_shared<ConstantExpr>(var->getInitValue());
         auto decl_stmt = std::make_shared<DeclStmt>(var, init_val);
@@ -114,6 +458,9 @@ static void emitArrayDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
     for (auto &array : arrays) {
         if (!options.getAllowDeadData() && array->getIsDead())
             continue;
+        // Views live in heap buffers
+        if (array->isView())
+            continue;
         auto type = array->getType();
         assert(type->isArrayType() && "Array should have an Array type");
         auto array_type = std::static_pointer_cast<ArrayType>(type);
@@ -135,6 +482,64 @@ void ProgramGenerator::emitDecl(std::shared_ptr<EmitCtx> ctx,
 
     emitArrayDecl(ctx, stream, ext_inp_sym_tbl->getArrays());
     emitArrayDecl(ctx, stream, ext_out_sym_tbl->getArrays());
+
+    emitBuffersDecl(ctx, stream);
+}
+
+void ProgramGenerator::emitBuffersDecl(std::shared_ptr<EmitCtx> ctx,
+                                       std::ostream &stream) {
+    if (buffers.empty())
+        return;
+    stream << "\n// Heap buffers and the views (element ranges) that they "
+              "hold\n";
+    for (auto &buffer : buffers) {
+        stream << "// " << buffer->getName() << ":";
+        for (auto &view : buffer->getViews()) {
+            stream << " " << view->getName(ctx) << " [" << view->getBufOffset()
+                   << ", " << view->getBufOffset() + view->getElemsNum() << ")";
+            if (view->isOpaque())
+                stream << " (opaque)";
+        }
+        stream << "\n";
+    }
+    for (auto &buffer : buffers) {
+        stream << buffer->getElemType()->getName(ctx) << " *"
+               << buffer->getName() << ";\n";
+    }
+}
+
+// Returns an access to the element [i_0] [i_1] ... of the array, as the driver
+// sees it. Views are accessed through their buffers.
+static std::string driverElemAccess(std::shared_ptr<EmitCtx> ctx,
+                                    std::shared_ptr<Array> array) {
+    std::stringstream ss;
+    auto array_type = std::static_pointer_cast<ArrayType>(array->getType());
+    size_t dims_num = array_type->getDimensions().size();
+    if (!array->isView()) {
+        ss << array->getName(ctx) << " ";
+        for (size_t i = 0; i < dims_num; ++i)
+            ss << "[i_" << i << "] ";
+        return ss.str();
+    }
+
+    auto strides = array->getStrides();
+    ss << array->getBuffer()->getName() << " [" << array->getBufOffset();
+    for (size_t i = 0; i < dims_num; ++i) {
+        ss << " + i_" << i;
+        if (strides.at(i) != 1)
+            ss << " * " << strides.at(i);
+    }
+    ss << "] ";
+    return ss.str();
+}
+
+// Same as driverElemAccess, but for scalar variables
+static std::string driverVarAccess(std::shared_ptr<EmitCtx> ctx,
+                                   std::shared_ptr<ScalarVar> var) {
+    if (!var->isView())
+        return var->getName(ctx);
+    return var->getBuffer()->getName() + " [" +
+           std::to_string(var->getBufOffset()) + "]";
 }
 
 static void emitArrayInit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
@@ -154,9 +559,7 @@ static void emitArrayInit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
             offset += "    ";
             idx++;
         }
-        stream << offset << array->getName(ctx) << " ";
-        for (size_t i = 0; i < idx; ++i)
-            stream << "[i_" << i << "] ";
+        stream << offset << driverElemAccess(ctx, array);
         stream << "= ";
         auto emit_const_expr = [&array, &ctx, &stream](bool use_main_vals) {
             auto init_val = array->getInitValues(use_main_vals);
@@ -180,9 +583,49 @@ static void emitArrayInit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
 void ProgramGenerator::emitInit(std::shared_ptr<EmitCtx> ctx,
                                 std::ostream &stream) {
     stream << "void init() {\n";
+    emitBuffersInit(ctx, stream);
     emitArrayInit(ctx, stream, ext_inp_sym_tbl->getArrays());
     emitArrayInit(ctx, stream, ext_out_sym_tbl->getArrays());
     stream << "}\n\n";
+}
+
+void ProgramGenerator::emitBuffersInit(std::shared_ptr<EmitCtx> ctx,
+                                       std::ostream &stream) {
+    for (auto &buffer : buffers) {
+        std::string type_name = buffer->getElemType()->getName(ctx);
+        stream << "    " << buffer->getName() << " = (" << type_name
+               << " *) malloc(" << buffer->getSize() << " * sizeof("
+               << type_name << "));\n";
+        // The views are initialized later. This only fills the gaps.
+        stream << "    for (size_t i = 0; i < " << buffer->getSize()
+               << "; ++i)\n";
+        stream << "        " << buffer->getName() << " [i] = ";
+        std::make_shared<ConstantExpr>(buffer->getFiller())->emit(ctx, stream);
+        stream << ";\n";
+    }
+    // Arrays are initialized in emitArrayInit
+    for (auto &var : ext_out_sym_tbl->getVars()) {
+        if (!var->isView())
+            continue;
+        stream << "    " << driverVarAccess(ctx, var) << " = ";
+        std::make_shared<ConstantExpr>(var->getInitValue())->emit(ctx, stream);
+        stream << ";\n";
+    }
+}
+
+void ProgramGenerator::emitBuffersCheck(std::shared_ptr<EmitCtx> ctx,
+                                        std::ostream &stream) {
+    Options &options = Options::getInstance();
+    // In the asserts mode the output views are checked one by one
+    if (options.getCheckAlgo() != CheckAlgo::HASH)
+        return;
+    // Inputs are never written, but we hash whole buffers anyway, so that
+    // stray writes are caught
+    for (auto &buffer : buffers) {
+        stream << "    for (size_t i = 0; i < " << buffer->getSize()
+               << "; ++i)\n";
+        stream << "        hash(&seed, " << buffer->getName() << " [i]);\n";
+    }
 }
 
 void ProgramGenerator::emitCheck(std::shared_ptr<EmitCtx> ctx,
@@ -197,7 +640,10 @@ void ProgramGenerator::emitCheck(std::shared_ptr<EmitCtx> ctx,
         ctx->setSYCLPrefix("app_");
 
     for (auto &var : ext_out_sym_tbl->getVars()) {
-        std::string var_name = var->getName(ctx);
+        // Views are hashed as a part of their buffers
+        if (var->isView() && options.getCheckAlgo() == CheckAlgo::HASH)
+            continue;
+        std::string var_name = driverVarAccess(ctx, var);
 
         if (options.getCheckAlgo() == CheckAlgo::HASH ||
             options.getCheckAlgo() == CheckAlgo::PRECOMPUTE) {
@@ -220,17 +666,17 @@ void ProgramGenerator::emitCheck(std::shared_ptr<EmitCtx> ctx,
     ctx->setSYCLPrefix("");
 
     for (const auto &array : ext_out_sym_tbl->getArrays()) {
+        // Views are hashed as a part of their buffers
+        if (array->isView() && options.getCheckAlgo() == CheckAlgo::HASH)
+            continue;
         std::string offset = "    ";
         auto type = array->getType();
         assert(type->isArrayType() && "Array should have an Array type");
         auto array_type = std::static_pointer_cast<ArrayType>(type);
         size_t idx = 0;
-        std::stringstream ss;
-        ss << array->getName(ctx) << " ";
         for (const auto &dimension : array_type->getDimensions()) {
             stream << offset << "for (size_t i_" << idx << " = 0; i_" << idx
                    << " < " << dimension << "; ++i_" << idx << ") \n";
-            ss << "[i_" << idx << "] ";
             offset += "    ";
             idx++;
         }
@@ -246,7 +692,7 @@ void ProgramGenerator::emitCheck(std::shared_ptr<EmitCtx> ctx,
         else
             ERROR("Unsupported");
 
-        std::string arr_name = ss.str();
+        std::string arr_name = driverElemAccess(ctx, array);
         stream << arr_name;
 
         if (options.getCheckAlgo() == CheckAlgo::ASSERTS) {
@@ -269,6 +715,7 @@ void ProgramGenerator::emitCheck(std::shared_ptr<EmitCtx> ctx,
             stream << ")";
         stream << ";\n";
     }
+    emitBuffersCheck(ctx, stream);
     stream << "}\n";
 }
 
@@ -286,6 +733,9 @@ static void emitVarExtDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
         ctx->setSYCLPrefix("app_");
     for (auto &var : vars) {
         if (!options.getAllowDeadData() && var->getIsDead())
+            continue;
+        // Views are always passed as parameters (see emitViewFuncParam)
+        if (var->isView())
             continue;
         bool pass_as_param = false;
         if (inp_category) {
@@ -316,6 +766,9 @@ static void emitArrayExtDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
     Options &options = Options::getInstance();
     for (auto &array : arrays) {
         if (!options.getAllowDeadData() && array->getIsDead())
+            continue;
+        // Views are always passed as parameters (see emitViewFuncParam)
+        if (array->isView())
             continue;
         bool pass_as_param = false;
         if (inp_category) {
@@ -421,7 +874,7 @@ static bool emitVarFuncParam(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
     return emit_any;
 }
 
-static void emitArrayFuncParam(std::shared_ptr<EmitCtx> ctx,
+static bool emitArrayFuncParam(std::shared_ptr<EmitCtx> ctx,
                                std::ostream &stream, bool prev_category_exist,
                                std::vector<std::shared_ptr<Array>> arrays,
                                bool emit_type, bool ispc_type, bool emit_dims) {
@@ -447,6 +900,60 @@ static void emitArrayFuncParam(std::shared_ptr<EmitCtx> ctx,
 
         first = false;
     }
+    return prev_category_exist || !first;
+}
+
+static std::string restrictKeyword() {
+    return Options::getInstance().isC() ? "restrict" : "__restrict";
+}
+
+// Views are passed to the test function as pointers into heap buffers: either
+// "T *p" (flat arrays and scalar variables) or "T (*p)[D1][D2]" (pointer to
+// array). With emit_type we emit the parameter declarations, otherwise the
+// arguments that the driver passes.
+static bool emitViewFuncParam(std::shared_ptr<EmitCtx> ctx,
+                              std::ostream &stream, bool prev_category_exist,
+                              std::vector<std::shared_ptr<Data>> views,
+                              bool emit_type) {
+    bool emit_any = prev_category_exist;
+    for (auto &view : views) {
+        std::string type_name = view->getBuffer()->getElemType()->getName(ctx);
+        bool ptr_to_arr = false;
+        std::string inner_dims;
+        if (view->isArray()) {
+            auto array = std::static_pointer_cast<Array>(view);
+            auto array_type =
+                std::static_pointer_cast<ArrayType>(array->getType());
+            auto &dims = array_type->getDimensions();
+            ptr_to_arr =
+                array->getViewKind() == ViewKind::PTR_TO_ARR && dims.size() > 1;
+            for (size_t i = 1; i < dims.size(); ++i)
+                inner_dims += "[" + std::to_string(dims.at(i)) + "]";
+        }
+
+        stream << placeSep(emit_any);
+        emit_any = true;
+        if (emit_type) {
+            std::string restr =
+                view->getEmitRestrict() ? restrictKeyword() + " " : "";
+            stream << type_name << " ";
+            if (ptr_to_arr)
+                stream << "(*" << restr << view->getName(ctx) << ")"
+                       << inner_dims;
+            else
+                stream << "*" << restr << view->getName(ctx);
+        }
+        else {
+            std::string ptr = view->getBuffer()->getName() + " + " +
+                              std::to_string(view->getBufOffset());
+            if (ptr_to_arr)
+                stream << "(" << type_name << " (*)" << inner_dims << ")("
+                       << ptr << ")";
+            else
+                stream << ptr;
+        }
+    }
+    return emit_any;
 }
 
 void emitSYCLBuffers(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
@@ -500,8 +1007,10 @@ void ProgramGenerator::emitTest(std::shared_ptr<EmitCtx> ctx,
     bool emit_any = emitVarFuncParam(ctx, stream, ext_inp_sym_tbl->getVars(),
                                      true, options.isISPC());
 
-    emitArrayFuncParam(ctx, stream, emit_any, ext_inp_sym_tbl->getArrays(),
-                       true, options.isISPC(), true);
+    emit_any =
+        emitArrayFuncParam(ctx, stream, emit_any, ext_inp_sym_tbl->getArrays(),
+                           true, options.isISPC(), true);
+    emitViewFuncParam(ctx, stream, emit_any, getParamViews(), true);
 
     stream << ") ";
 
@@ -553,8 +1062,9 @@ void ProgramGenerator::emitMain(std::shared_ptr<EmitCtx> ctx,
 
     bool emit_any =
         emitVarFuncParam(ctx, stream, ext_inp_sym_tbl->getVars(), true, false);
-    emitArrayFuncParam(ctx, stream, emit_any, ext_inp_sym_tbl->getArrays(),
-                       true, false, true);
+    emit_any = emitArrayFuncParam(
+        ctx, stream, emit_any, ext_inp_sym_tbl->getArrays(), true, false, true);
+    emitViewFuncParam(ctx, stream, emit_any, getParamViews(), true);
 
     stream << ");";
     if (options.isISPC())
@@ -567,11 +1077,15 @@ void ProgramGenerator::emitMain(std::shared_ptr<EmitCtx> ctx,
     emit_any =
         emitVarFuncParam(ctx, stream, ext_inp_sym_tbl->getVars(), false, false);
 
-    emitArrayFuncParam(ctx, stream, emit_any, ext_inp_sym_tbl->getArrays(),
-                       false, false, false);
+    emit_any =
+        emitArrayFuncParam(ctx, stream, emit_any, ext_inp_sym_tbl->getArrays(),
+                           false, false, false);
+    emitViewFuncParam(ctx, stream, emit_any, getParamViews(), false);
 
     stream << ");\n";
     stream << "    checksum();\n";
+    for (auto &buffer : buffers)
+        stream << "    free(" << buffer->getName() << ");\n";
     stream << "    printf(\"%llu\\n\", seed);\n";
     if (options.getCheckAlgo() == CheckAlgo::PRECOMPUTE) {
         stream << "    if (seed != " << hash_seed << "ULL) \n";

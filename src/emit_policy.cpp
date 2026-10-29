@@ -24,10 +24,10 @@ EmitPolicy::EmitPolicy() {
     asserts_check_distr.emplace_back(Probability<bool>(false, 50));
 
     pass_as_param_distr.emplace_back(Probability<bool>(true, 50));
-    pass_as_param_distr.emplace_back(Probability<bool>(true, 50));
+    pass_as_param_distr.emplace_back(Probability<bool>(false, 50));
 
     emit_align_attr_distr.emplace_back(Probability<bool>(true, 50));
-    emit_align_attr_distr.emplace_back(Probability<bool>(true, 50));
+    emit_align_attr_distr.emplace_back(Probability<bool>(false, 50));
 
     align_size_distr.emplace_back(
         Probability<AlignmentSize>(AlignmentSize::A16, 33));

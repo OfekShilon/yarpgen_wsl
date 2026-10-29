@@ -25,6 +25,8 @@ using namespace yarpgen;
 std::shared_ptr<EmitCtx> EmitCtx::default_emit_ctx =
     std::make_shared<EmitCtx>();
 
+size_t PopulateCtx::omp_simd_regions_num = 0;
+
 PopulateCtx::PopulateCtx(std::shared_ptr<PopulateCtx> _par_ctx)
     : PopulateCtx() {
     local_sym_tbl = std::make_shared<SymbolTable>();
@@ -42,10 +44,13 @@ PopulateCtx::PopulateCtx(std::shared_ptr<PopulateCtx> _par_ctx)
         inside_mutation = par_ctx->isInsideMutation();
         inside_omp_simd = par_ctx->inside_omp_simd;
         omp_reduction_vars = par_ctx->omp_reduction_vars;
+        omp_simd_region = par_ctx->omp_simd_region;
         dims = par_ctx->dims;
         in_stencil = par_ctx->in_stencil;
         mul_vals_iter = par_ctx->mul_vals_iter;
         allow_mul_vals = par_ctx->allow_mul_vals;
+        opaque_mode = par_ctx->opaque_mode;
+        opaque_reads = par_ctx->opaque_reads;
     }
 }
 
@@ -59,9 +64,12 @@ PopulateCtx::PopulateCtx() {
     inside_mutation = false;
     inside_omp_simd = false;
     omp_reduction_vars = nullptr;
+    omp_simd_region = 0;
     in_stencil = false;
     mul_vals_iter = nullptr;
     allow_mul_vals = false;
+    opaque_mode = false;
+    opaque_reads = nullptr;
 }
 
 size_t PopulateCtx::generateNumberOfDims(ArrayDimsUseKind dims_use_kind) const {

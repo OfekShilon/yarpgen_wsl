@@ -35,9 +35,11 @@ void ScalarVar::dbgDump() {
     std::cout << "Is dead: " << is_dead << std::endl;
 }
 
-std::shared_ptr<ScalarVar> ScalarVar::create(std::shared_ptr<PopulateCtx> ctx) {
+std::shared_ptr<ScalarVar> ScalarVar::create(std::shared_ptr<PopulateCtx> ctx,
+                                             IntTypeID type_id) {
     auto gen_pol = ctx->getGenPolicy();
-    IntTypeID type_id = rand_val_gen->getRandId(gen_pol->int_type_distr);
+    if (type_id == IntTypeID::MAX_INT_TYPE_ID)
+        type_id = rand_val_gen->getRandId(gen_pol->int_type_distr);
     IRValue init_val = rand_val_gen->getRandValue(type_id);
     auto int_type = IntegralType::init(type_id);
     NameHandler &nh = NameHandler::getInstance();
@@ -74,7 +76,8 @@ void Array::dbgDump() {
 
 Array::Array(std::string _name, const std::shared_ptr<ArrayType> &_type,
              IRValue _val)
-    : Data(std::move(_name), _type), mul_vals_axis_idx(-1) {
+    : Data(std::move(_name), _type), mul_vals_axis_idx(-1),
+      view_kind(ViewKind::FLAT) {
     if (!type->isArrayType())
         ERROR("Array variable should have an ArrayType");
 
@@ -88,6 +91,23 @@ Array::Array(std::string _name, const std::shared_ptr<ArrayType> &_type,
         ERROR("Array initialization value should have the same type as array");
 
     ub_code = init_vals[Options::main_val_idx].getUBCode();
+}
+
+size_t Array::getElemsNum() {
+    auto array_type = std::static_pointer_cast<ArrayType>(type);
+    size_t ret = 1;
+    for (const auto &dim : array_type->getDimensions())
+        ret *= dim;
+    return ret;
+}
+
+std::vector<size_t> Array::getStrides() {
+    auto array_type = std::static_pointer_cast<ArrayType>(type);
+    auto &dims = array_type->getDimensions();
+    std::vector<size_t> ret(dims.size(), 1);
+    for (size_t i = dims.size() - 1; i > 0; --i)
+        ret.at(i - 1) = ret.at(i) * dims.at(i);
+    return ret;
 }
 
 void Array::setInitValue(IRValue _val, bool use_main_vals,
@@ -118,9 +138,9 @@ void Array::setCurrentValue(IRValue _val, bool use_main_vals) {
     }
 }
 
-std::shared_ptr<Array> Array::create(std::shared_ptr<PopulateCtx> ctx,
-                                     bool inp) {
-    auto array_type = ArrayType::create(ctx);
+std::shared_ptr<Array> Array::create(std::shared_ptr<PopulateCtx> ctx, bool inp,
+                                     IntTypeID elem_type_id) {
+    auto array_type = ArrayType::create(ctx, elem_type_id);
     auto base_type = array_type->getBaseType();
     if (!base_type->isIntType())
         ERROR("We support only array of integers for now");

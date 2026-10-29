@@ -205,6 +205,9 @@ class PopulateCtx : public GenCtx {
 
     void setInsideOMPSimd(bool val) { inside_omp_simd = val; }
     bool isInsideOMPSimd() { return inside_omp_simd; }
+    // Each "#pragma omp simd" loop gets a unique non-zero region id
+    void startOMPSimdRegion() { omp_simd_region = ++omp_simd_regions_num; }
+    size_t getOMPSimdRegion() { return inside_omp_simd ? omp_simd_region : 0; }
 
     // Shared (not deep-copied) across a "#pragma omp simd" loop's whole
     // body, so that nested scopes/loops all register into the same list,
@@ -232,6 +235,19 @@ class PopulateCtx : public GenCtx {
     void setAllowMulVals(bool _val) { allow_mul_vals = _val; }
     bool getAllowMulVals() { return allow_mul_vals; }
 
+    // Opaque mode builds an expression that is well defined for any values
+    // of its leaves, so it may read opaque inputs (see Data::isOpaque)
+    void setOpaqueMode(bool _val) { opaque_mode = _val; }
+    bool isOpaqueMode() { return opaque_mode; }
+    // Opaque inputs that the current opaque expression reads. Shared across
+    // the whole expression tree.
+    void setOpaqueReads(std::shared_ptr<std::vector<std::shared_ptr<Data>>> v) {
+        opaque_reads = std::move(v);
+    }
+    std::shared_ptr<std::vector<std::shared_ptr<Data>>> getOpaqueReads() {
+        return opaque_reads;
+    }
+
   private:
     std::shared_ptr<PopulateCtx> par_ctx;
     std::shared_ptr<SymbolTable> ext_inp_sym_tbl;
@@ -248,6 +264,8 @@ class PopulateCtx : public GenCtx {
     // TODO: we need to think about pragma omp ordered simd
     bool inside_omp_simd;
     std::shared_ptr<std::vector<OmpReductionVar>> omp_reduction_vars;
+    size_t omp_simd_region;
+    static size_t omp_simd_regions_num;
 
     // Each loop header has a limit that any iterator should respect
     // For the simplicity, we assume that the limit is the same for all
@@ -267,6 +285,9 @@ class PopulateCtx : public GenCtx {
     std::shared_ptr<Iterator> mul_vals_iter;
     // If we want to allow multiple values in this context
     bool allow_mul_vals;
+
+    bool opaque_mode;
+    std::shared_ptr<std::vector<std::shared_ptr<Data>>> opaque_reads;
 };
 
 // TODO: maybe we need to inherit from some class

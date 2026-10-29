@@ -36,6 +36,7 @@ import stat
 import sys
 import time
 import queue
+import random
 
 import common
 import gen_test_makefile
@@ -211,6 +212,14 @@ class Test(object):
     # Forwarded to the generator's --max-array-dims flag. 0 means the flag is
     # omitted entirely, matching the generator's own default (unlimited).
     max_array_dims = 0
+    # Forwarded to the generator's --alias flag ("none", "disjoint", "stores",
+    # "loads"), or "random" to pick one of them per test. "none" means the flag
+    # is omitted entirely, matching the generator's own default.
+    alias_mode = "none"
+    # Forwarded to the generator's --emit-restrict flag ("none", "some", "all").
+    # "some" means the flag is omitted entirely, matching the generator's own
+    # default.
+    emit_restrict = "some"
 
     # Generate new test
     # stat is statistics object
@@ -238,6 +247,13 @@ class Test(object):
             yarpgen_run_list.append("--vectorizer-target=" + Test.vectorizer_target)
         if Test.omp_simd_pragma != "on":
             yarpgen_run_list.append("--omp-simd=" + Test.omp_simd_pragma)
+        alias_mode = Test.alias_mode
+        if alias_mode == "random":
+            alias_mode = random.choice(["none", "disjoint", "stores", "loads"])
+        if alias_mode != "none":
+            yarpgen_run_list.append("--alias=" + alias_mode)
+        if Test.emit_restrict != "some":
+            yarpgen_run_list.append("--emit-restrict=" + Test.emit_restrict)
         self.yarpgen_cmd = " ".join(str(p) for p in yarpgen_run_list)
         self.ret_code, self.stdout, self.stderr, self.is_time_expired, self.elapsed_time = \
             common.run_cmd(yarpgen_run_list, yarpgen_timeout, proc_num, yarpgen_mem_limit)
@@ -1808,6 +1824,15 @@ Use specified folder for testing
                              "dimensions. 0 omits the flag (generator default, unlimited), except when an "
                              "MSVC target is selected, in which case it's auto-capped at 3 to fit MSVC's "
                              "2GB image limit.")
+    parser.add_argument("--alias", dest="alias_mode", default="none",
+                        choices=["none", "disjoint", "stores", "loads", "random"], type=str,
+                        help="Forwarded to the generator's --alias: how far arrays may alias each other "
+                             "through heap buffers passed to the test function as pointers. 'random' picks "
+                             "a level per test. 'none' omits the flag (generator default).")
+    parser.add_argument("--emit-restrict", dest="emit_restrict", default="some",
+                        choices=["none", "some", "all"], type=str,
+                        help="Forwarded to the generator's --emit-restrict: whether heap views that overlap "
+                             "nothing else get a restrict qualifier. Only meaningful when --alias != none.")
     args = parser.parse_args()
 
     log_level = logging.DEBUG if args.verbose else logging.INFO
@@ -1837,6 +1862,8 @@ Use specified folder for testing
     Test.vectorizer_target = args.vectorizer_target
     Test.omp_simd_pragma = args.omp_simd_pragma
     Test.max_array_dims = args.max_array_dims
+    Test.alias_mode = args.alias_mode
+    Test.emit_restrict = args.emit_restrict
     prepare_env_and_start_testing(os.path.abspath(args.out_dir), args.timeout, targets, args.num_jobs,
                                   args.config_file, args.seeds_option_value, args.blame, args.creduce,
                                   args.no_tmp_cleaner, args.collect_stat)

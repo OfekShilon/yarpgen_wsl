@@ -36,9 +36,18 @@ class ProgramGenerator {
     void emitTest(std::shared_ptr<EmitCtx> ctx, std::ostream &stream);
     void emitMain(std::shared_ptr<EmitCtx> ctx, std::ostream &stream);
 
+    // Places some of the arrays into heap buffers (see Options::getAlias())
+    void layoutBuffers(std::shared_ptr<GenPolicy> gen_pol);
+    void emitBuffersDecl(std::shared_ptr<EmitCtx> ctx, std::ostream &stream);
+    void emitBuffersInit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream);
+    void emitBuffersCheck(std::shared_ptr<EmitCtx> ctx, std::ostream &stream);
+    // Data that is views, in the order it is passed to the test function
+    std::vector<std::shared_ptr<Data>> getParamViews();
+
     std::shared_ptr<SymbolTable> ext_inp_sym_tbl;
     std::shared_ptr<SymbolTable> ext_out_sym_tbl;
     std::shared_ptr<ScopeStmt> new_test;
+    std::vector<std::shared_ptr<Buffer>> buffers;
 
     unsigned long long int hash_seed;
     void hash(unsigned long long int const v);

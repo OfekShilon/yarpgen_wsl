@@ -167,6 +167,8 @@ enum class OptionKind {
     SIMPLE_LOOPS,
     VECTORIZER_TARGET,
     OMP_SIMD_PRAGMA,
+    ALIAS,
+    EMIT_RESTRICT,
     MAX_OPTION_ID
 };
 
@@ -177,6 +179,27 @@ enum class OptionLevel { NONE, SOME, ALL, MAX_OPTION_LEVEL };
 enum class VectorizerTarget { MSVC, GCC_CLANG, MAX_VECTORIZER_TARGET };
 
 enum class LangStd { C, CXX, ISPC, SYCL, MAX_LANG_STD };
+
+// How far the generator may go in making arrays alias each other. Each level
+// includes the previous ones.
+// NONE: no heap views, arrays are plain globals (the classic behavior).
+// DISJOINT: arrays may live in heap buffers and be passed to the test
+//           function as pointers, but views never overlap.
+// STORES: views may overlap, as long as only stores alias.
+// LOADS: loads may read storage that aliases stores.
+enum class AliasLevel { NONE, DISJOINT, STORES, LOADS, MAX_ALIAS_LEVEL };
+
+// How an array that lives in a heap buffer is passed to the test function.
+// FLAT: "T *p", subscripts are linearized by hand: p[i * D + j].
+// PTR_TO_ARR: "T (*p)[D]", subscripts are left as is: p[i][j].
+enum class ViewKind { FLAT, PTR_TO_ARR, MAX_VIEW_KIND };
+
+// Distance between the starts of two overlapping array views.
+// ZERO: exact alias.
+// SMALL: a few elements (see GenPolicy::alias_small_dist_distr).
+// STRIDE: the stride of one of the dimensions, e.g., one row apart.
+// RANDOM: anything that keeps the views overlapping.
+enum class AliasDistKind { ZERO, SMALL, STRIDE, RANDOM, MAX_ALIAS_DIST_KIND };
 
 enum class AlignmentSize {
     A16,

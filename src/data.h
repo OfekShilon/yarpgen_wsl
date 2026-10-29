@@ -23,22 +23,27 @@ limitations under the License.
 #include "ir_value.h"
 #include "options.h"
 #include "type.h"
+#include <algorithm>
 #include <array>
 #include <deque>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace yarpgen {
 
 class GenCtx;
 class PopulateCtx;
 class EmitCtx;
+class Buffer;
 
 class Data {
   public:
     Data(std::string _name, std::shared_ptr<Type> _type)
         : name(std::move(_name)), type(std::move(_type)),
-          ub_code(UBKind::Uninit), is_dead(true), alignment(0) {}
+          ub_code(UBKind::Uninit), is_dead(true), alignment(0), buffer(nullptr),
+          buf_offset(0), emit_restrict(false), alias_target(nullptr),
+          omp_simd_region(0), overlap_allowed(true), opaque(false) {}
     virtual ~Data() = default;
 
     virtual std::string getName(std::shared_ptr<EmitCtx> ctx) { return name; }
@@ -66,6 +71,52 @@ class Data {
     void setAlignment(size_t _alignment) { alignment = _alignment; }
     size_t getAlignment() { return alignment; }
 
+    // A view is data that lives in a heap buffer instead of being a global.
+    // It is always passed to the test function as a pointer.
+    bool isView() { return buffer != nullptr; }
+    void setBuffer(std::shared_ptr<Buffer> _buffer, size_t _buf_offset) {
+        buffer = std::move(_buffer);
+        buf_offset = _buf_offset;
+    }
+    std::shared_ptr<Buffer> getBuffer() { return buffer; }
+    // Offset (in elements) of the view within its buffer
+    size_t getBufOffset() { return buf_offset; }
+    void setEmitRestrict(bool _val) { emit_restrict = _val; }
+    bool getEmitRestrict() { return emit_restrict; }
+    // Number of elements that the data takes in a buffer
+    virtual size_t getElemsNum() { return 1; }
+
+    // Hints for ProgramGenerator::layoutBuffers.
+    // An output that the layout should try to overlap this output with
+    void setAliasTarget(std::shared_ptr<Data> _target) {
+        alias_target = std::move(_target);
+    }
+    std::shared_ptr<Data> getAliasTarget() { return alias_target; }
+    // The "#pragma omp simd" region where the data is written (0 if none).
+    // The pragma promises that there are no loop-carried dependencies, so
+    // outputs of the same region must never overlap.
+    void setOMPSimdRegion(size_t _region) { omp_simd_region = _region; }
+    size_t getOMPSimdRegion() { return omp_simd_region; }
+    // False if the test reads the data back and needs exactly the value that
+    // the generator computed (e.g., a "+=" reduction target)
+    void setOverlapAllowed(bool _val) { overlap_allowed = _val; }
+    bool getOverlapAllowed() { return overlap_allowed; }
+    // An opaque input may overlap outputs, so the generator doesn't know its
+    // values. Only expressions that are well defined for any value read it.
+    void setOpaque(bool _val) { opaque = _val; }
+    bool isOpaque() { return opaque; }
+    // The "#pragma omp simd" regions where an opaque input is read. Outputs of
+    // these regions must never overlap it.
+    void addReadOMPSimdRegion(size_t _region) {
+        if (_region != 0 && !isReadInOMPSimdRegion(_region))
+            read_omp_simd_regions.push_back(_region);
+    }
+    bool isReadInOMPSimdRegion(size_t _region) {
+        return std::find(read_omp_simd_regions.begin(),
+                         read_omp_simd_regions.end(),
+                         _region) != read_omp_simd_regions.end();
+    }
+
   protected:
     template <typename T> static std::shared_ptr<Data> makeVaryingImpl(T val) {
         auto ret = std::make_shared<T>(val);
@@ -84,6 +135,15 @@ class Data {
     // They create a lot of dead code in the test, so we need to prune them.
     bool is_dead;
     size_t alignment;
+
+    std::shared_ptr<Buffer> buffer;
+    size_t buf_offset;
+    bool emit_restrict;
+    std::shared_ptr<Data> alias_target;
+    size_t omp_simd_region;
+    bool overlap_allowed;
+    bool opaque;
+    std::vector<size_t> read_omp_simd_regions;
 };
 
 // Shorthand to make it simpler
@@ -132,7 +192,10 @@ class ScalarVar : public Data {
 
     void dbgDump() final;
 
-    static std::shared_ptr<ScalarVar> create(std::shared_ptr<PopulateCtx> ctx);
+    // If type_id is set, the variable gets that type instead of a random one
+    static std::shared_ptr<ScalarVar>
+    create(std::shared_ptr<PopulateCtx> ctx,
+           IntTypeID type_id = IntTypeID::MAX_INT_TYPE_ID);
 
     std::shared_ptr<Data> makeVarying() override {
         return makeVaryingImpl(*this);
@@ -141,6 +204,39 @@ class ScalarVar : public Data {
   private:
     IRValue init_val;
     IRValue cur_val;
+};
+
+// A chunk of heap memory that the driver allocates and passes (in parts) to the
+// test function. Arrays and scalar variables that are "views" live inside a
+// buffer at some element offset. All views of a buffer share its element type,
+// so that the overlap of views never breaks strict aliasing rules.
+class Buffer {
+  public:
+    Buffer(std::string _name, std::shared_ptr<IntegralType> _elem_type)
+        : name(std::move(_name)), elem_type(std::move(_elem_type)), size(0),
+          filler(elem_type->getIntTypeId()) {}
+
+    std::string getName() { return name; }
+    std::shared_ptr<IntegralType> getElemType() { return elem_type; }
+    // Size in elements
+    size_t getSize() { return size; }
+    void setSize(size_t _size) { size = _size; }
+    // The value that the driver writes to the whole buffer before it
+    // initializes the views
+    IRValue getFiller() { return filler; }
+    void setFiller(IRValue _filler) { filler = _filler; }
+
+    std::vector<std::shared_ptr<Data>> &getViews() { return views; }
+    void addView(std::shared_ptr<Data> view) {
+        views.push_back(std::move(view));
+    }
+
+  private:
+    std::string name;
+    std::shared_ptr<IntegralType> elem_type;
+    size_t size;
+    IRValue filler;
+    std::vector<std::shared_ptr<Data>> views;
 };
 
 class Array : public Data {
@@ -166,12 +262,22 @@ class Array : public Data {
     DataKind getKind() final { return DataKind::ARR; }
 
     void dbgDump() final;
-    static std::shared_ptr<Array> create(std::shared_ptr<PopulateCtx> ctx,
-                                         bool inp);
+    // If elem_type_id is set, the array gets that element type instead of a
+    // random one
+    static std::shared_ptr<Array>
+    create(std::shared_ptr<PopulateCtx> ctx, bool inp,
+           IntTypeID elem_type_id = IntTypeID::MAX_INT_TYPE_ID);
 
     std::shared_ptr<Data> makeVarying() override {
         return makeVaryingImpl(*this);
     };
+
+    void setViewKind(ViewKind _kind) { view_kind = _kind; }
+    ViewKind getViewKind() { return view_kind; }
+    // Total number of elements
+    size_t getElemsNum() final;
+    // Distance (in elements) between consecutive indices of each dimension
+    std::vector<size_t> getStrides();
 
   private:
     // TODO:
@@ -191,6 +297,8 @@ class Array : public Data {
     // We use int64_t to use negative values as poison values that
     // indicate that the values are uniform
     int64_t mul_vals_axis_idx;
+
+    ViewKind view_kind;
 };
 
 class Expr;

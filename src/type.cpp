@@ -253,9 +253,11 @@ std::string ArrayType::getName(std::shared_ptr<EmitCtx> ctx) {
     return base_type->getName(ctx) + " *";
 }
 
-std::shared_ptr<ArrayType> ArrayType::create(std::shared_ptr<PopulateCtx> ctx) {
+std::shared_ptr<ArrayType> ArrayType::create(std::shared_ptr<PopulateCtx> ctx,
+                                             IntTypeID base_type_id) {
     auto gen_pol = ctx->getGenPolicy();
-    IntTypeID base_type_id = rand_val_gen->getRandId(gen_pol->int_type_distr);
+    if (base_type_id == IntTypeID::MAX_INT_TYPE_ID)
+        base_type_id = rand_val_gen->getRandId(gen_pol->int_type_distr);
     auto base_type = IntegralType::init(base_type_id);
 
     // Determine how many dimensions do we want, relative to the current

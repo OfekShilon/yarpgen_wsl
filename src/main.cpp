@@ -31,6 +31,23 @@ int main(int argc, char *argv[]) {
     OptionParser::parse(argc, argv);
 
     Options &options = Options::getInstance();
+    if (options.useHeapViews()) {
+        if (options.isISPC() || options.isSYCL()) {
+            std::cerr << "ERROR: --alias is supported only for C and C++"
+                      << std::endl;
+            return 1;
+        }
+        // Overlapping views make the exact values of some arrays unknown to
+        // the generator, so we can only compare hashes between runs
+        if (options.getAlias() != AliasLevel::DISJOINT &&
+            options.getCheckAlgo() != CheckAlgo::HASH) {
+            std::cerr << "ERROR: --alias=stores|loads requires "
+                         "--check-algo=hash"
+                      << std::endl;
+            return 1;
+        }
+    }
+
     rand_val_gen = std::make_shared<RandValGen>(options.getSeed());
     options.setSeed(rand_val_gen->getSeed());
 

@@ -247,6 +247,29 @@ std::vector<OptionDescr> yarpgen::OptionParser::options_set{
      OptionParser::parseOmpSimdPragma,
      "on",
      {"on", "off"}},
+    {OptionKind::ALIAS,
+     "",
+     "--alias",
+     true,
+     "Allocate some arrays in heap buffers and pass them to the test "
+     "function as pointers, to challenge alias analysis: 'none' keeps "
+     "all arrays as globals; 'disjoint' uses heap views that never "
+     "overlap; 'stores' lets output views overlap; 'loads' also lets "
+     "inputs overlap outputs. 'stores' and 'loads' need --check-algo=hash",
+     "Can't parse alias option",
+     OptionParser::parseAlias,
+     "none",
+     {"none", "disjoint", "stores", "loads"}},
+    {OptionKind::EMIT_RESTRICT,
+     "",
+     "--emit-restrict",
+     true,
+     "Emit restrict qualifiers on heap view parameters that don't overlap "
+     "any other view. Only meaningful when --alias != none",
+     "Can't parse emit restrict option",
+     OptionParser::parseEmitRestrict,
+     "some",
+     {"none", "some", "all"}},
 };
 
 static void dumpVersion(std::ostream &stream) {
@@ -595,6 +618,32 @@ void OptionParser::parseVectorizerTarget(std::string vectorizer_target_str) {
         options.setVectorizerTarget(VectorizerTarget::GCC_CLANG);
     else
         printHelpAndExit("Can't recognize vectorizer target option");
+}
+
+void OptionParser::parseAlias(std::string alias_str) {
+    Options &options = Options::getInstance();
+    if (alias_str == "none")
+        options.setAlias(AliasLevel::NONE);
+    else if (alias_str == "disjoint")
+        options.setAlias(AliasLevel::DISJOINT);
+    else if (alias_str == "stores")
+        options.setAlias(AliasLevel::STORES);
+    else if (alias_str == "loads")
+        options.setAlias(AliasLevel::LOADS);
+    else
+        printHelpAndExit("Can't recognize alias option");
+}
+
+void OptionParser::parseEmitRestrict(std::string emit_restrict_str) {
+    Options &options = Options::getInstance();
+    if (emit_restrict_str == "none")
+        options.setEmitRestrict(OptionLevel::NONE);
+    else if (emit_restrict_str == "some")
+        options.setEmitRestrict(OptionLevel::SOME);
+    else if (emit_restrict_str == "all")
+        options.setEmitRestrict(OptionLevel::ALL);
+    else
+        printHelpAndExit("Can't recognize emit restrict option");
 }
 
 void Options::dump(std::ostream &stream) {

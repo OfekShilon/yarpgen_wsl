@@ -323,7 +323,10 @@ class ArrayType : public Type {
          bool _is_static, CVQualifier _cv_qual, bool _is_uniform = true);
     static std::shared_ptr<ArrayType> init(std::shared_ptr<Type> _base_type,
                                            std::vector<size_t> _dims);
-    static std::shared_ptr<ArrayType> create(std::shared_ptr<PopulateCtx> ctx);
+    // If base_type_id is set, it is used instead of a random base type
+    static std::shared_ptr<ArrayType>
+    create(std::shared_ptr<PopulateCtx> ctx,
+           IntTypeID base_type_id = IntTypeID::MAX_INT_TYPE_ID);
 
     std::shared_ptr<Type> makeVarying() override;
 

@@ -103,6 +103,8 @@ class OptionParser {
     static void parseSimpleLoops(std::string simple_loops_str);
     static void parseVectorizerTarget(std::string vectorizer_target_str);
     static void parseOmpSimdPragma(std::string omp_simd_pragma_str);
+    static void parseAlias(std::string alias_str);
+    static void parseEmitRestrict(std::string emit_restrict_str);
 };
 
 class Options {
@@ -202,6 +204,16 @@ class Options {
     void setOmpSimdPragma(bool _val) { omp_simd_pragma = _val; }
     bool getOmpSimdPragma() { return omp_simd_pragma; }
 
+    // How far arrays may alias each other (see AliasLevel). Anything other
+    // than NONE makes some arrays views into heap buffers.
+    void setAlias(AliasLevel _val) { alias = _val; }
+    AliasLevel getAlias() { return alias; }
+    bool useHeapViews() { return alias != AliasLevel::NONE; }
+
+    // Whether views that overlap nothing else may be "restrict"-qualified
+    void setEmitRestrict(OptionLevel _val) { emit_restrict = _val; }
+    OptionLevel getEmitRestrict() { return emit_restrict; }
+
     void dump(std::ostream &stream);
 
   private:
@@ -215,8 +227,8 @@ class Options {
           mutation_kind(MutationKind::NONE), mutation_seed(0),
           allow_ub_in_dc(OptionLevel::NONE), max_array_dims(0),
           simple_loops(OptionLevel::NONE),
-          vectorizer_target(VectorizerTarget::GCC_CLANG),
-          omp_simd_pragma(true) {}
+          vectorizer_target(VectorizerTarget::GCC_CLANG), omp_simd_pragma(true),
+          alias(AliasLevel::NONE), emit_restrict(OptionLevel::SOME) {}
 
     std::vector<std::string> raw_options;
 
@@ -258,5 +270,8 @@ class Options {
     // Which vectorizer's recognizable loop shapes to constrain to.
     VectorizerTarget vectorizer_target;
     bool omp_simd_pragma;
+
+    AliasLevel alias;
+    OptionLevel emit_restrict;
 };
 } // namespace yarpgen

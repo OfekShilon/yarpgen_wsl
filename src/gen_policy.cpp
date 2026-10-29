@@ -425,6 +425,125 @@ GenPolicy::GenPolicy() {
     vectorizable_loop_distr.emplace_back(true, 20);
     vectorizable_loop_distr.emplace_back(false, 70);
     shuffleProbProxy(vectorizable_loop_distr);
+
+    // Heap views. These distributions are not shuffled: shuffling consumes
+    // random values, and we want --alias=none tests to stay exactly the same.
+    heap_view_prob.emplace_back(true, 70);
+    heap_view_prob.emplace_back(false, 30);
+
+    scalar_view_prob.emplace_back(true, 50);
+    scalar_view_prob.emplace_back(false, 50);
+
+    view_kind_distr.emplace_back(ViewKind::FLAT, 50);
+    view_kind_distr.emplace_back(ViewKind::PTR_TO_ARR, 50);
+
+    share_buffer_prob.emplace_back(true, 75);
+    share_buffer_prob.emplace_back(false, 25);
+
+    // Zero gaps are the most interesting: runtime alias checks have to get
+    // the boundary exactly right
+    view_gap_distr.emplace_back(0, 40);
+    view_gap_distr.emplace_back(1, 20);
+    view_gap_distr.emplace_back(3, 10);
+    view_gap_distr.emplace_back(8, 10);
+    view_gap_distr.emplace_back(16, 10);
+    view_gap_distr.emplace_back(61, 10);
+
+    buffer_misalign_distr.emplace_back(0, 60);
+    buffer_misalign_distr.emplace_back(1, 30);
+    buffer_misalign_distr.emplace_back(3, 10);
+
+    emit_restrict_prob.emplace_back(true, 50);
+    emit_restrict_prob.emplace_back(false, 50);
+
+    alias_out_arr_prob.emplace_back(true, 40);
+    alias_out_arr_prob.emplace_back(false, 60);
+
+    alias_out_var_prob.emplace_back(true, 40);
+    alias_out_var_prob.emplace_back(false, 60);
+
+    alias_candidates_num = 4;
+
+    alias_dist_distr.emplace_back(AliasDistKind::ZERO, 20);
+    alias_dist_distr.emplace_back(AliasDistKind::SMALL, 35);
+    alias_dist_distr.emplace_back(AliasDistKind::STRIDE, 25);
+    alias_dist_distr.emplace_back(AliasDistKind::RANDOM, 20);
+
+    // Typical vector lengths (in elements) and their neighbors
+    alias_small_dist_distr.emplace_back(1, 25);
+    alias_small_dist_distr.emplace_back(2, 15);
+    alias_small_dist_distr.emplace_back(3, 10);
+    alias_small_dist_distr.emplace_back(4, 15);
+    alias_small_dist_distr.emplace_back(8, 15);
+    alias_small_dist_distr.emplace_back(16, 10);
+    alias_small_dist_distr.emplace_back(17, 5);
+    alias_small_dist_distr.emplace_back(32, 5);
+
+    opaque_inp_arr_num_distr.emplace_back(0, 30);
+    opaque_inp_arr_num_distr.emplace_back(1, 45);
+    opaque_inp_arr_num_distr.emplace_back(2, 25);
+
+    opaque_expr_prob.emplace_back(true, 50);
+    opaque_expr_prob.emplace_back(false, 50);
+
+    opaque_arr_use_prob.emplace_back(true, 70);
+    opaque_arr_use_prob.emplace_back(false, 30);
+
+    alias_opaque_target_prob.emplace_back(true, 80);
+    alias_opaque_target_prob.emplace_back(false, 20);
+}
+
+void GenPolicy::makeOpaque() {
+    // Opaque expressions do all the arithmetic in unsigned long long (see
+    // ArithmeticExpr::create), so only division and shifts can have UB. We
+    // also drop the nodes that have their own rules for the values (calls,
+    // stencils) and casts, which are added explicitly.
+    std::vector<Probability<IRNodeKind>> new_node_distr;
+    for (auto &item : arith_node_distr) {
+        switch (item.getId()) {
+            case IRNodeKind::CONST:
+            case IRNodeKind::SCALAR_VAR_USE:
+            case IRNodeKind::SUBSCRIPT:
+            case IRNodeKind::UNARY:
+            case IRNodeKind::BINARY:
+            case IRNodeKind::TERNARY:
+                new_node_distr.push_back(item);
+                break;
+            default:
+                break;
+        }
+    }
+    // Opaque inputs are read only through subscripts
+    auto subs = std::find_if(new_node_distr.begin(), new_node_distr.end(),
+                             [](Probability<IRNodeKind> &item) {
+                                 return item.getId() == IRNodeKind::SUBSCRIPT;
+                             });
+    if (subs == new_node_distr.end())
+        new_node_distr.emplace_back(IRNodeKind::SUBSCRIPT, leaves_prob_bump);
+    else if (subs->getProb() == 0)
+        subs->increaseProb(leaves_prob_bump);
+    arith_node_distr = new_node_distr;
+
+    std::vector<Probability<BinaryOp>> new_bin_op_distr;
+    bool zero_prob = true;
+    for (auto &item : binary_op_distr) {
+        switch (item.getId()) {
+            case BinaryOp::DIV:
+            case BinaryOp::MOD:
+            case BinaryOp::SHL:
+            case BinaryOp::SHR:
+                break;
+            default:
+                new_bin_op_distr.push_back(item);
+                zero_prob &= item.getProb() == 0;
+                break;
+        }
+    }
+    if (zero_prob) {
+        new_bin_op_distr.emplace_back(BinaryOp::ADD, 10);
+        new_bin_op_distr.emplace_back(BinaryOp::BIT_XOR, 10);
+    }
+    binary_op_distr = new_bin_op_distr;
 }
 
 void GenPolicy::makeVectorizable(bool simple) {
@@ -787,7 +906,9 @@ void GenPolicy::uniformProbFromMax(std::vector<Probability<T>> &distr,
 
 template <class T, class U>
 void GenPolicy::removeProbability(std::vector<Probability<T>> &orig, U id) {
-    (void)std::remove_if(
-        orig.begin(), orig.end(),
-        [&id](Probability<T> &elem) -> bool { return elem.getId() == id; });
+    orig.erase(std::remove_if(orig.begin(), orig.end(),
+                              [&id](Probability<T> &elem) -> bool {
+                                  return elem.getId() == id;
+                              }),
+               orig.end());
 }

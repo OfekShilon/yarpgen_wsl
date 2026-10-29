@@ -22,6 +22,8 @@ limitations under the License.
 #include "options.h"
 #include <algorithm>
 #include <deque>
+#include <iterator>
+#include <limits>
 #include <numeric>
 #include <utility>
 
@@ -1131,6 +1133,22 @@ static std::shared_ptr<Expr> createStencil(std::shared_ptr<PopulateCtx> ctx) {
 #endif
 }
 
+// Opaque expressions do all the arithmetic in unsigned long long: every node
+// that has another type is explicitly converted. Without division and shifts
+// (see GenPolicy::makeOpaque), that is well defined for any values, so it
+// doesn't matter that the values of opaque inputs are unknown.
+static std::shared_ptr<Expr> castToULLong(std::shared_ptr<Expr> expr) {
+    expr->propagateType();
+    auto type = expr->getValue()->getType();
+    if (!type->isIntType())
+        ERROR("Opaque expressions support only integral types");
+    if (std::static_pointer_cast<IntegralType>(type)->getIntTypeId() ==
+        IntTypeID::ULLONG)
+        return expr;
+    return std::make_shared<TypeCastExpr>(
+        expr, IntegralType::init(IntTypeID::ULLONG), /*is_implicit*/ false);
+}
+
 std::shared_ptr<Expr> ArithmeticExpr::create(std::shared_ptr<PopulateCtx> ctx) {
     auto gen_pol = ctx->getGenPolicy();
     std::shared_ptr<Expr> new_node;
@@ -1166,7 +1184,10 @@ std::shared_ptr<Expr> ArithmeticExpr::create(std::shared_ptr<PopulateCtx> ctx) {
     }
     gen_pol = active_ctx->getGenPolicy();
 
+    // Similar operators may bring back the operators that opaque expressions
+    // can't have (see GenPolicy::makeOpaque)
     bool apply_similar_op =
+        !active_ctx->isOpaqueMode() &&
         rand_val_gen->getRandId(gen_pol->apply_similar_op_distr);
     if (apply_similar_op) {
         auto new_gen_policy = std::make_shared<GenPolicy>(*gen_pol);
@@ -1207,8 +1228,8 @@ std::shared_ptr<Expr> ArithmeticExpr::create(std::shared_ptr<PopulateCtx> ctx) {
         new_node = ConstantExpr::create(active_ctx);
     }
     else if (node_kind == IRNodeKind::SCALAR_VAR_USE ||
-             ((active_ctx->getExtInpSymTable()->getArrays().empty() ||
-               active_ctx->getLocalSymTable()->getIters().empty()) &&
+             ((active_ctx->getLocalSymTable()->getIters().empty() ||
+               SubscriptExpr::getSuitableArrays(active_ctx).empty()) &&
               (node_kind == IRNodeKind::SUBSCRIPT ||
                node_kind == IRNodeKind::STENCIL))) {
         auto new_scalar_var_use_expr = ScalarVarUseExpr::create(active_ctx);
@@ -1240,6 +1261,9 @@ std::shared_ptr<Expr> ArithmeticExpr::create(std::shared_ptr<PopulateCtx> ctx) {
     }
     else
         ERROR("Bad node kind");
+
+    if (active_ctx->isOpaqueMode())
+        new_node = castToULLong(new_node);
 
     ctx->decArithDepth();
 
@@ -2000,14 +2024,69 @@ Expr::EvalResType SubscriptExpr::rebuild(EvalCtx &ctx) {
     idx = std::make_shared<BinaryExpr>(BinaryOp::MOD, idx, size_constant);
 
     eval_res = evaluate(ctx);
-    assert(eval_res->hasUB() && "All of the UB should be fixed by now");
+    assert(!eval_res->hasUB() && "All of the UB should be fixed by now");
     value = eval_res;
     return eval_res;
+}
+
+// Flat views are passed to the test function as plain pointers, so the whole
+// chain of subscripts has to be emitted as a single linearized index:
+// arr [(i + 1) * 625 + (j) * 25 + k - 1]
+// Returns false if the subscript is not an access to a multi-dimensional flat
+// view.
+bool SubscriptExpr::emitLinearized(std::shared_ptr<EmitCtx> ctx,
+                                   std::ostream &stream) {
+    // The last subscript in the source (the one with the highest active_dim)
+    // goes first
+    std::vector<SubscriptExpr *> chain;
+    SubscriptExpr *cur = this;
+    chain.push_back(cur);
+    while (cur->array->getKind() == IRNodeKind::SUBSCRIPT) {
+        cur = static_cast<SubscriptExpr *>(cur->array.get());
+        chain.push_back(cur);
+    }
+    if (chain.size() < 2 || cur->array->getKind() != IRNodeKind::ARRAY_USE)
+        return false;
+    auto data = cur->array->getValue();
+    if (!data->isArray())
+        return false;
+    auto arr = std::static_pointer_cast<Array>(data);
+    if (!arr->isView() || arr->getViewKind() != ViewKind::FLAT)
+        return false;
+
+    auto strides = arr->getStrides();
+    // Iterators may have narrow types, so we switch to 64-bit arithmetic
+    // if the linearized index may not fit into int
+    bool wide = arr->getElemsNum() >
+                static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    stream << arr->getName(ctx) << " [";
+    bool first = true;
+    // Row-major order: the outermost dimension goes first
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        SubscriptExpr *subs = *it;
+        size_t stride = strides.at(subs->active_dim);
+        if (!first)
+            stream << " + ";
+        first = false;
+        if (stride != 1)
+            stream << "(";
+        subs->idx->emit(ctx, stream);
+        if (subs->stencil_offset != 0) {
+            stream << (subs->stencil_offset > 0 ? " + " : " - ")
+                   << std::to_string(std::abs(subs->stencil_offset));
+        }
+        if (stride != 1)
+            stream << ") * " << stride << (wide ? "ULL" : "");
+    }
+    stream << "]";
+    return true;
 }
 
 void SubscriptExpr::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
                          std::string offset) {
     stream << offset;
+    if (emitLinearized(ctx, stream))
+        return;
     // TODO: it may cause some problems in the future
     array->emit(ctx, stream);
     stream << " [";
@@ -2029,9 +2108,11 @@ SubscriptExpr::getSuitableArrays(std::shared_ptr<PopulateCtx> ctx) {
         auto arr_type = std::static_pointer_cast<ArrayType>(arr->getType());
         if (arr_type->getDimensions().front() < ctx->getDimensions().front())
             continue;
+        // The values of opaque inputs are unknown
+        if (arr->isOpaque() && !ctx->isOpaqueMode())
+            continue;
         avail_arrs.push_back(arr);
     }
-    assert(!avail_arrs.empty());
     return avail_arrs;
 }
 
@@ -2044,7 +2125,25 @@ SubscriptExpr::create(std::shared_ptr<PopulateCtx> ctx) {
     }
     else {
         auto avail_arrs = getSuitableArrays(ctx);
+        if (ctx->isOpaqueMode()) {
+            std::vector<std::shared_ptr<Array>> opaque_arrs;
+            std::copy_if(avail_arrs.begin(), avail_arrs.end(),
+                         std::back_inserter(opaque_arrs),
+                         [](const std::shared_ptr<Array> &arr) {
+                             return arr->isOpaque();
+                         });
+            if (!opaque_arrs.empty() &&
+                rand_val_gen->getRandId(
+                    ctx->getGenPolicy()->opaque_arr_use_prob))
+                avail_arrs = opaque_arrs;
+        }
+        if (avail_arrs.empty())
+            ERROR("No suitable arrays");
         auto inp_arr = rand_val_gen->getRandElem(avail_arrs);
+        if (inp_arr->isOpaque()) {
+            inp_arr->addReadOMPSimdRegion(ctx->getOMPSimdRegion());
+            ctx->getOpaqueReads()->push_back(inp_arr);
+        }
         return init(inp_arr, ctx);
     }
     ERROR("Unreachable!");
@@ -2401,6 +2500,7 @@ std::shared_ptr<Expr> SubscriptExpr::copy() {
     ret->active_size = active_size;
     ret->idx_int_type_id = idx_int_type_id;
     ret->stencil_offset = stencil_offset;
+    ret->at_mul_val_axis = at_mul_val_axis;
     return ret;
 }
 
@@ -2556,6 +2656,75 @@ void AssignmentExpr::emit(std::shared_ptr<EmitCtx> ctx, std::ostream &stream,
     }
 }
 
+// Element type of a scalar variable or an array (MAX_INT_TYPE_ID for null)
+static IntTypeID dataElemTypeId(const std::shared_ptr<Data> &data) {
+    if (!data)
+        return IntTypeID::MAX_INT_TYPE_ID;
+    auto type = data->getType();
+    if (type->isArrayType())
+        type = std::static_pointer_cast<ArrayType>(type)->getBaseType();
+    return std::static_pointer_cast<IntegralType>(type)->getIntTypeId();
+}
+
+// With --alias=stores and above, a new output may get a hint to overlap one
+// of the recent outputs. ProgramGenerator::layoutBuffers then puts both of
+// them into the same heap buffer. Outputs are never read (except by their own
+// reductions, see ReductionExpr::isSafeWithAnyValue), so the result is still
+// well defined: the last store wins. With --alias=loads, the target may also
+// be an opaque input (see Data::isOpaque).
+static std::shared_ptr<Data> pickAliasTarget(std::shared_ptr<PopulateCtx> ctx,
+                                             bool is_var) {
+    if (Options::getInstance().getAlias() < AliasLevel::STORES)
+        return nullptr;
+    // Scalar outputs inside "#pragma omp simd" are reduction variables. They
+    // are named in the reduction clause, so they can't be pointers.
+    if (is_var && ctx->isInsideOMPSimd())
+        return nullptr;
+    auto gen_pol = ctx->getGenPolicy();
+    size_t region = ctx->getOMPSimdRegion();
+    std::vector<std::shared_ptr<Data>> candidates;
+
+    // An opaque expression may also overlap its output with the opaque inputs
+    // that it reads, which creates read-after-write dependencies
+    if (ctx->isOpaqueMode() &&
+        rand_val_gen->getRandId(gen_pol->alias_opaque_target_prob)) {
+        for (auto &inp : *ctx->getOpaqueReads())
+            // "#pragma omp simd" promises that there are no loop-carried
+            // dependencies
+            if (region == 0 || !inp->isReadInOMPSimdRegion(region))
+                candidates.push_back(inp);
+        if (!candidates.empty())
+            return candidates.at(rand_val_gen->getRandValue(
+                static_cast<size_t>(0), candidates.size() - 1));
+    }
+
+    if (!rand_val_gen->getRandId(is_var ? gen_pol->alias_out_var_prob
+                                        : gen_pol->alias_out_arr_prob))
+        return nullptr;
+
+    auto add_candidates = [&candidates, &gen_pol, region](auto all) {
+        size_t start = all.size() > gen_pol->alias_candidates_num
+                           ? all.size() - gen_pol->alias_candidates_num
+                           : 0;
+        for (size_t i = start; i < all.size(); ++i) {
+            auto &cand = all.at(i);
+            // "#pragma omp simd" promises that there are no loop-carried
+            // dependencies, so outputs of the same loop can't overlap
+            if (region != 0 && cand->getOMPSimdRegion() == region)
+                continue;
+            if (cand->isScalarVar() && cand->getOMPSimdRegion() != 0)
+                continue;
+            candidates.push_back(cand);
+        }
+    };
+    add_candidates(ctx->getExtOutSymTable()->getVars());
+    add_candidates(ctx->getExtOutSymTable()->getArrays());
+    if (candidates.empty())
+        return nullptr;
+    return candidates.at(rand_val_gen->getRandValue(static_cast<size_t>(0),
+                                                    candidates.size() - 1));
+}
+
 std::shared_ptr<AssignmentExpr>
 AssignmentExpr::create(std::shared_ptr<PopulateCtx> ctx) {
     auto gen_pol = ctx->getGenPolicy();
@@ -2614,14 +2783,21 @@ AssignmentExpr::create(std::shared_ptr<PopulateCtx> ctx) {
         out_kind = DataKind::ARR;
 
     if ((out_kind == DataKind::VAR || ctx->getLoopDepth() == 0)) {
-        auto new_var = ScalarVar::create(ctx);
+        auto alias_target = pickAliasTarget(ctx, true);
+        auto new_var = ScalarVar::create(ctx, dataElemTypeId(alias_target));
+        new_var->setAliasTarget(alias_target);
+        new_var->setOMPSimdRegion(ctx->getOMPSimdRegion());
         ctx->getExtOutSymTable()->addVar(new_var);
         auto new_scalar_use_expr = std::make_shared<ScalarVarUseExpr>(new_var);
         new_scalar_use_expr->setIsDead(false);
         to = new_scalar_use_expr;
     }
     else if (out_kind == DataKind::ARR) {
-        auto new_array = Array::create(ctx, false);
+        auto alias_target = pickAliasTarget(ctx, false);
+        auto new_array =
+            Array::create(ctx, false, dataElemTypeId(alias_target));
+        new_array->setAliasTarget(alias_target);
+        new_array->setOMPSimdRegion(ctx->getOMPSimdRegion());
         ctx->getExtOutSymTable()->addArray(new_array);
         auto new_subs_expr = SubscriptExpr::init(new_array, ctx);
         new_subs_expr->setIsDead(false);
@@ -3045,6 +3221,16 @@ static std::string ompReductionOpToken(BinaryOp bin_op, LibCallKind lib_call) {
 
 std::string ReductionExpr::getOmpReductionOp() {
     return ompReductionOpToken(bin_op, lib_call_kind);
+}
+
+bool ReductionExpr::isSafeWithAnyValue() {
+    if (is_degenerate)
+        return true;
+    if (bin_op != BinaryOp::MAX_BIN_OP)
+        return bin_op == BinaryOp::BIT_AND || bin_op == BinaryOp::BIT_OR ||
+               bin_op == BinaryOp::BIT_XOR;
+    return lib_call_kind == LibCallKind::MIN ||
+           lib_call_kind == LibCallKind::MAX;
 }
 
 std::shared_ptr<ReductionExpr>
